@@ -29,15 +29,26 @@ CRITICAL RULES:
 - Prioritize famous global and Arab real people.
 
 SMART STRATEGY:
-- First 3 questions: broad classification (gender, real person, field).
-- Next 3 questions: narrow category (actor, athlete, singer, politician, scientist, etc).
-- After question 6: start thinking about guessing.
-- If confidence >= 0.6, make a guess.
-- Never ask more than 8 questions without guessing.
+- First 3 questions: broad classification only (gender, real person, field).
+- Next questions: narrow the category using traits only (actor, athlete, singer, politician, scientist, fictional, alive, nationality, etc).
+- Ask only YES/NO questions about general traits and attributes.
+- NEVER mention, suggest, or ask about any person's name during the question phase.
+- NEVER ask questions like: "Is it Michael Jackson?" or "Is it [name]?"
+- During the question phase, do not show candidate names, examples, or suggestions.
+- Stay in question mode for at least 7 questions.
+- Only after question 7, if confidence is high enough, make ONE guess.
+- Never ask more than 8 questions without making a guess.
+
+IF GUESS IS REJECTED:
+- If the user says "no" to a guess, do NOT immediately guess another name.
+- Return to question mode.
+- Ask more trait-based yes/no questions.
+- Do not repeat rejected guesses.
+- Gather more information before making the next guess.
 
 LANGUAGE:
-- If language is 'ar', all questions must be in Arabic only.
-- If language is 'en', all questions must be in English only.
+- If language is 'ar', all questions and guesses must be in Arabic only.
+- If language is 'en', all questions and guesses must be in English only.
 
 IMPORTANT:
 - Do not repeat questions.
@@ -49,9 +60,7 @@ Question:
 {"type":"question","text":"..."}
 
 Guess:
-{"type":"guess","name":"...","confidence":0.7}`;
-}
-
+{"type":"guess","name":"...","confidence":0.7}
 function sessionMessages(session) {
   const transcript = session.turns
     .map((t, index) => {
