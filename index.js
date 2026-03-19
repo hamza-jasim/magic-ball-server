@@ -154,7 +154,7 @@ async function fetchWikipediaSummary(name, language = 'ar') {
     return {
       title: name,
       extract: language === 'ar'
-        ? 'لا توجد معلومات متاحة'
+        ? 'لا توجد معلومات  متاحة'
         : 'No information available',
       imageURL: null,
       articleURL: `https://${lang}.wikipedia.org/wiki/${title}`
