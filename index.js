@@ -55,19 +55,18 @@ IMPORTANT:
 - Do not ask vague or useless questions.
 - Be decisive and confident.
 - Output STRICT JSON only.
-
-Question:
+- For questions, output only:
 {"type":"question","text":"..."}
-
-Guess:
+- For guesses, output only:
 {"type":"guess","name":"...","confidence":0.7}`;
 }
+
 function sessionMessages(session) {
-  const transcript = session.turns
-    .map((t, index) => {
-      return `Q${index + 1}: ${t.question}\nA${index + 1}: ${t.answer}`;
-    })
-    .join('\n');
+  const transcript = session.turns.length
+    ? session.turns
+        .map((t, index) => `Q${index + 1}: ${t.question}\nA${index + 1}: ${t.answer}`)
+        .join('\n')
+    : 'No questions asked yet.';
 
   const rejected = session.rejectedGuesses.length
     ? `Rejected guesses: ${session.rejectedGuesses.join(', ')}`
@@ -88,24 +87,74 @@ function normalizeAnswer(answer) {
   return map[answer] || 'dont_know';
 }
 
+function safeFallbackQuestion(language, count = 0) {
+  const ar = [
+    'هل هذه الشخصية حقيقية؟',
+    'هل هذه الشخصية رجل؟',
+    'هل هذه الشخصية مشهورة عالمياً؟',
+    'هل تعمل هذه الشخصية في الفن؟',
+    'هل هذه الشخصية على قيد الحياة؟',
+    'هل هذه الشخصية عربية؟',
+    'هل تعمل هذه الشخصية في الغناء؟',
+    'هل تعمل هذه الشخصية في التمثيل؟'
+  ];
+
+  const en = [
+    'Is this person real?',
+    'Is this person male?',
+    'Is this person globally famous?',
+    'Does this person work in entertainment?',
+    'Is this person alive?',
+    'Is this person Arab?',
+    'Does this person work in singing?',
+    'Does this person work in acting?'
+  ];
+
+  const list = language === 'ar' ? ar : en;
+  return { type: 'question', text: list[Math.min(count, list.length - 1)] };
+}
+
+function sanitizeEngineResult(result, session) {
+  if (!result || typeof result !== 'object') {
+    return safeFallbackQuestion(session.language, session.turns.length);
+  }
+
+  if (result.type === 'guess') {
+    const name = String(result.name || '').trim();
+    const confidence = Number(result.confidence || 0);
+
+    if (!name) {
+      return safeFallbackQuestion(session.language, session.turns.length);
+    }
+
+    if (session.rejectedGuesses.includes(name)) {
+      return safeFallbackQuestion(session.language, session.turns.length);
+    }
+
+    return {
+      type: 'guess',
+      name,
+      confidence: Number.isFinite(confidence) ? confidence : 0.5
+    };
+  }
+
+  if (result.type === 'question') {
+    const text = String(result.text || '').trim();
+
+    if (!text) {
+      return safeFallbackQuestion(session.language, session.turns.length);
+    }
+
+    return { type: 'question', text };
+  }
+
+  return safeFallbackQuestion(session.language, session.turns.length);
+}
+
 async function askEngine(session) {
   if (!openai) {
-    const fallbackQuestions = session.language === 'ar'
-      ? [
-          'هل هذه الشخصية عربية؟',
-          'هل هذه الشخصية رجل؟',
-          'هل هذه الشخصية فنان؟',
-          'هل هذه الشخصية رياضي؟'
-        ]
-      : [
-          'Is this person Arab?',
-          'Is this person male?',
-          'Is this person an artist?',
-          'Is this person an athlete?'
-        ];
-
-    if (session.turns.length < fallbackQuestions.length) {
-      return { type: 'question', text: fallbackQuestions[session.turns.length] };
+    if (session.turns.length < 7) {
+      return safeFallbackQuestion(session.language, session.turns.length);
     }
 
     return {
@@ -115,9 +164,19 @@ async function askEngine(session) {
     };
   }
 
+  const forceQuestion =
+    session.turns.length < 7 ||
+    (session.lastGuessRejected === true && session.turns.length < 9);
+
+  const extraRule = forceQuestion
+    ? session.language === 'ar'
+      ? '\nImportant override: اسأل سؤالاً فقط الآن ولا تقم بأي تخمين.'
+      : '\nImportant override: Ask a question only now and do not make any guess.'
+    : '';
+
   const response = await openai.chat.completions.create({
     model,
-    temperature: 0.7,
+    temperature: 0.3,
     response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: makeSystemPrompt(session.language) },
@@ -128,7 +187,10 @@ async function askEngine(session) {
 Game state:
 ${sessionMessages(session)}
 
-Generate the next best question or guess in the specified language.`
+Question count: ${session.turns.length}
+Rejected guess count: ${session.rejectedGuesses.length}${extraRule}
+
+Generate the next best ${forceQuestion ? 'question' : 'question or guess'} in the specified language.`
       }
     ]
   });
@@ -136,11 +198,10 @@ Generate the next best question or guess in the specified language.`
   const raw = response.choices[0]?.message?.content || '{}';
 
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return sanitizeEngineResult(parsed, session);
   } catch {
-    return session.language === 'ar'
-      ? { type: 'question', text: 'هل هذه الشخصية مشهورة؟' }
-      : { type: 'question', text: 'Is this person famous?' };
+    return safeFallbackQuestion(session.language, session.turns.length);
   }
 }
 
@@ -177,77 +238,112 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.post('/api/game/start', async (req, res) => {
-  const language = req.body?.language === 'en' ? 'en' : 'ar';
-  const sessionId = crypto.randomUUID();
+  try {
+    const language = req.body?.language === 'en' ? 'en' : 'ar';
+    const sessionId = crypto.randomUUID();
 
-  const session = {
-    id: sessionId,
-    language,
-    turns: [],
-    rejectedGuesses: []
-  };
+    const session = {
+      id: sessionId,
+      language,
+      turns: [],
+      rejectedGuesses: [],
+      lastGuessRejected: false
+    };
 
-  sessions.set(sessionId, session);
+    sessions.set(sessionId, session);
 
-  const result = await askEngine(session);
-
-  res.json({ sessionId, ...result });
+    const result = await askEngine(session);
+    res.json({ sessionId, ...result });
+  } catch (error) {
+    console.error('start error:', error);
+    res.status(500).json({
+      error: 'Failed to start game',
+      detail: error?.message || 'Unknown error'
+    });
+  }
 });
 
 app.post('/api/game/answer', async (req, res) => {
-  const { sessionId, question, answer } = req.body || {};
-  const session = sessions.get(sessionId);
+  try {
+    const { sessionId, question, answer } = req.body || {};
+    const session = sessions.get(sessionId);
 
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    session.turns.push({
+      question: String(question || ''),
+      answer: normalizeAnswer(answer)
+    });
+
+    session.lastGuessRejected = false;
+
+    const result = await askEngine(session);
+    res.json(result);
+  } catch (error) {
+    console.error('answer error:', error);
+    res.status(500).json({
+      error: 'Failed to answer question',
+      detail: error?.message || 'Unknown error'
+    });
   }
-
-  session.turns.push({
-    question,
-    answer: normalizeAnswer(answer)
-  });
-
-  const result = await askEngine(session);
-
-  res.json(result);
 });
 
 app.post('/api/game/guess-confirm', async (req, res) => {
-  const { sessionId, guessName, correct } = req.body || {};
-  const session = sessions.get(sessionId);
+  try {
+    const { sessionId, guessName, correct } = req.body || {};
+    const session = sessions.get(sessionId);
 
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
 
-  if (correct) {
-    const wiki = await fetchWikipediaSummary(guessName, session.language);
+    if (correct) {
+      const wiki = await fetchWikipediaSummary(String(guessName || ''), session.language);
 
-    return res.json({
-      type: 'revealed',
-      guessName,
-      wiki
+      return res.json({
+        type: 'revealed',
+        guessName,
+        wiki
+      });
+    }
+
+    if (guessName) {
+      session.rejectedGuesses.push(String(guessName));
+    }
+
+    session.lastGuessRejected = true;
+
+    const result = await askEngine(session);
+    return res.json(result);
+  } catch (error) {
+    console.error('guess-confirm error:', error);
+    res.status(500).json({
+      error: 'Failed to confirm guess',
+      detail: error?.message || 'Unknown error'
     });
   }
-
-  session.rejectedGuesses.push(guessName);
-
-  const result = await askEngine(session);
-
-  return res.json(result);
 });
 
 app.get('/api/wiki', async (req, res) => {
-  const name = String(req.query.name || '');
-  const language = req.query.language === 'en' ? 'en' : 'ar';
+  try {
+    const name = String(req.query.name || '');
+    const language = req.query.language === 'en' ? 'en' : 'ar';
 
-  if (!name) {
-    return res.status(400).json({ error: 'name is required' });
+    if (!name) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    const wiki = await fetchWikipediaSummary(name, language);
+    res.json(wiki);
+  } catch (error) {
+    console.error('wiki error:', error);
+    res.status(500).json({
+      error: 'Failed to fetch wiki',
+      detail: error?.message || 'Unknown error'
+    });
   }
-
-  const wiki = await fetchWikipediaSummary(name, language);
-
-  res.json(wiki);
 });
 
 app.listen(port, () => {
