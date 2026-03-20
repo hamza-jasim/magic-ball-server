@@ -60,7 +60,8 @@ Question:
 {"type":"question","text":"..."}
 
 Guess:
-{"type":"guess","name":"...","confidence":0.7}
+{"type":"guess","name":"...","confidence":0.7}`;
+}
 function sessionMessages(session) {
   const transcript = session.turns
     .map((t, index) => {
