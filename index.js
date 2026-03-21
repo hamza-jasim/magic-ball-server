@@ -26,68 +26,60 @@ const SESSIONS_FILE = path.join(process.cwd(), 'sessions-backup.json');
 const MIN_QUESTIONS_BEFORE_GUESS = 7;
 const MAX_QUESTIONS_BEFORE_GUESS = 12;
 const QUESTIONS_AFTER_REJECTED_GUESS = 2;
-const CONFIDENCE_THRESHOLD = 0.65; // إذا الثقة أقل من 65%، اسأل أكثر
+const CONFIDENCE_THRESHOLD = 0.65;
 
 // ============================================================
-// 🔥 SYSTEM PROMPT — نسخة 10/10 احترافية جداً
+// 🔥 SYSTEM PROMPT — يمنع الأسئلة المفتوحة تماماً
 // ============================================================
 function makeSystemPrompt(language = 'ar') {
   return `
-أنت محرك تخمين شخصيات فائق الذكاء مع قدرة تحليل عميقة.
+أنت محرك تخمين شخصيات. قواعدك صارمة جداً:
 
-مهمتك:
-تحديد الشخصية بأقل عدد من الأسئلة وبأقصى دقة ممكنة.
+🚨 القاعدة الأهم 🚨
+يجب أن يكون كل سؤال من نوع "نعم/لا" فقط.
+لا تسأل أبداً أسئلة مثل:
+- "أي حقبة؟"
+- "كم عمره؟"
+- "من أين هو؟"
+- "ما هي جنسيته؟"
+- "في أي مجال؟"
 
-=== القواعد الذهبية ===
-1. اسأل سؤالاً واحداً بنعم/لا فقط.
-2. أخرج JSON صارماً فقط: {"type":"question","text":"..."} أو {"type":"guess","name":"...","confidence":0.XX,"reasoning":"..."}
-3. لا تفسيرات. لا ماركداون.
-4. لا تذكر أسماء أبداً في وضع السؤال.
-5. كل سؤال يجب أن يلغي 30-60% من الاحتمالات.
+بدلاً من ذلك، اسأل بشكل ثنائي:
+✅ "هل هو من العصر الحديث؟"
+✅ "هل عمره أكثر من 50 سنة؟"
+✅ "هل هو عربي؟"
+✅ "هل هو ممثل؟"
 
-=== استراتيجية التخمين الذكية ===
-الطبقة 1 — التصنيف العام (الأسئلة 1-3)
-- حقيقي vs خيالي
-- الجنس (ذكر/أنثى/غير محدد)
-- المجال الرئيسي: (رياضة، تمثيل، سياسة، موسيقى، علوم، إنترنت، تاريخ، أعمال، فنون)
+=== القواعد ===
+1. اسأل سؤالاً واحداً فقط، يجاب بـ (نعم/لا/ربما/لا أعرف).
+2. أخرج JSON صارماً فقط.
+3. لا تذكر أسماء في وضع السؤال.
+4. كل سؤال يجب أن يلغي 30-60% من الاحتمالات.
 
-الطبقة 2 — التخصص الدقيق (الأسئلة 4-6)
-- إذا رياضي: (كرة قدم، كرة سلة، تنس، ملاكمة، مصارعة، سباحة، جولف، فورمولا 1)
-- إذا ممثل: (هوليوود، بوليوود، عربي، مسرح، أفلام أكشن، كوميديا، دراما)
-- إذا مغني: (بوب، راب، كلاسيكي، عربي، غربي، روك، ميتال)
-- إذا سياسي: (رئيس، ملك، ثوري، ديكتاتور، رئيس وزراء، حقبة حديثة، حقبة قديمة)
-- إذا عالم: (فيزياء، كيمياء، أحياء، رياضيات، حاسوب، طب، فلك)
-- العصر: (قديم جداً، حديث، معاصر)
-- الحالة: (حي/ميت)
-- الجنسية: (عربي، أمريكي، أوروبي، آسيوي، إفريقي، لاتيني)
+=== استراتيجية الأسئلة ===
+الأسئلة المسموحة فقط:
+- هل هو [ذكر/أنثى]؟
+- هل هو [حقيقي/خيالي]؟
+- هل هو [حي/ميت]؟
+- هل هو [عربي/أجنبي]؟
+- هل هو من [العصر الحديث/القديم]؟
+- هل هو [ممثل/مغني/رياضي/سياسي/عالم]؟
+- هل حصل على [جوائز/بطولات]؟
+- هل هو مشهور عالمياً؟
+- هل له [أعمال/إنجازات] معروفة؟
 
-الطبقة 3 — التحليل العميق (الأسئلة 7-10)
-- السمات المميزة: (شكل، صوت، أسلوب، شهرة عالمية، جوائز، فضائح، إنجازات)
-- الإرث: (تأثير، ابتكارات، أعمال خالدة، بصمة)
-- العلاقات: (شراكات شهيرة، أعداء، عائلة مشهورة)
-- التفاصيل الدقيقة: (نادٍ، فريق، قناة، شركة، حدث تاريخي)
-
-=== تحليل الثقة (Confidence) ===
-عند التخمين، أضف حقل reasoning يشرح لماذا هذا التخمين:
-- الثقة 0.9+ : متأكد 100% بناءً على الأدلة
-- الثقة 0.75-0.89 : احتمال كبير جداً
-- الثقة 0.6-0.74 : احتمال متوسط
-- الثقة أقل من 0.6 : لا تخمن، اسأل المزيد
-
-=== قواعد متقدمة ===
-- إذا الثقة أقل من ${CONFIDENCE_THRESHOLD}، لا تخمن واسأل المزيد
-- بعد تخمين مرفوض، حلل الخطأ: "لماذا كان تخميني خاطئاً؟ ما المعلومات الناقصة؟"
-- لا تكرر تخميناً مرفوضاً أبداً
-- تعلم من الأنماط: إذا تم رفض تخمين مشابه، غيّر الاستراتيجية
+=== التخمين ===
+عندما تكون واثقاً (أكثر من 65%)، اخمن بالتنسيق:
+{"type":"guess","name":"الاسم","confidence":0.85,"reasoning":"سبب مختصر"}
 
 تنسيق المخرجات:
 سؤال: {"type":"question","text":"هل هو رياضي؟"}
-تخمين: {"type":"guess","name":"ليونيل ميسي","confidence":0.92,"reasoning":"لاعب كرة قدم أرجنتيني، فاز بالكرة الذهبية، لعب في برشلونة"}
+تخمين: {"type":"guess","name":"ليونيل ميسي","confidence":0.92,"reasoning":"لاعب كرة قدم أرجنتيني مشهور"}
 `;
 }
 
 // ============================================================
-// 🔥 تحليل عميق للتخمينات المرفوضة
+// 🔥 تحليل التخمينات المرفوضة
 // ============================================================
 async function analyzeFailedGuess(session, wrongGuess) {
   if (!openai) return null;
@@ -99,7 +91,7 @@ async function analyzeFailedGuess(session, wrongGuess) {
       messages: [
         {
           role: 'system',
-          content: 'أنت محلل استراتيجي. حلل لماذا فشل التخمين واقترح استراتيجية جديدة.'
+          content: 'أنت محلل. حلل لماذا فشل التخمين واقترح 3 أسئلة جديدة من نوع نعم/لا.'
         },
         {
           role: 'user',
@@ -108,18 +100,14 @@ async function analyzeFailedGuess(session, wrongGuess) {
 الأسئلة والأجوبة السابقة:
 ${sessionMessages(session)}
 
-حلل:
+المطلوب:
 1. لماذا كان هذا التخمين خاطئاً؟
-2. ما هي المعلومات الناقصة التي أحتاجها؟
-3. ما هي أفضل 3 أسئلة قادمة لتضييق الاحتمالات؟
-4. اقترح تخميناً جديداً محتملاً.
+2. ما هي 3 أسئلة (نعم/لا فقط) لتضييق الاحتمالات؟
 
 أجب بتنسيق JSON:
 {
   "reason": "...",
-  "missingInfo": ["...", "..."],
-  "nextQuestions": ["...", "...", "..."],
-  "suggestedGuess": "..."
+  "nextQuestions": ["سؤال نعم/لا 1", "سؤال نعم/لا 2", "سؤال نعم/لا 3"]
 }
 `
         }
@@ -133,7 +121,7 @@ ${sessionMessages(session)}
 }
 
 // ============================================================
-// 🔥 حفظ الجلسات بشكل دائم
+// 🔥 حفظ واسترجاع الجلسات
 // ============================================================
 async function backupSessions() {
   try {
@@ -146,7 +134,6 @@ async function backupSessions() {
       createdAt: session.createdAt,
       lastActivity: new Date().toISOString()
     }));
-    
     await fs.writeFile(SESSIONS_FILE, JSON.stringify(sessionsData, null, 2));
   } catch (error) {
     console.error('Failed to backup sessions:', error);
@@ -157,7 +144,6 @@ async function loadSessions() {
   try {
     const data = await fs.readFile(SESSIONS_FILE, 'utf-8');
     const sessionsData = JSON.parse(data);
-    
     sessionsData.forEach(sessionData => {
       sessions.set(sessionData.id, {
         ...sessionData,
@@ -165,18 +151,14 @@ async function loadSessions() {
         lastActivity: new Date(sessionData.lastActivity)
       });
     });
-    
-    console.log(`✅ Loaded ${sessionsData.length} sessions from backup`);
+    console.log(`✅ Loaded ${sessionsData.length} sessions`);
   } catch {
-    console.log('No existing sessions backup found');
+    console.log('No existing sessions backup');
   }
 }
 
-// Backup sessions every 5 minutes
-setInterval(backupSessions, 5 * 60 * 1000);
-
 // ============================================================
-// 🔥 تحسين الـ HISTORY
+// 🔥 عرض حالة اللعبة
 // ============================================================
 function sessionMessages(session) {
   const turns = session.turns
@@ -184,20 +166,19 @@ function sessionMessages(session) {
     .join('\n');
 
   return `
-=== حالة اللعبة ===
-اللغة: ${session.language}
-عدد الجولات: ${session.turns.length}
+=== GAME STATE ===
+Language: ${session.language}
+Turns: ${session.turns.length}
+Questions since last rejected guess: ${session.questionsSinceLastRejectedGuess}
+Rejected guesses: ${session.rejectedGuesses.join(', ') || 'none'}
 
 ${turns}
-
-التخمينات المرفوضة: ${session.rejectedGuesses.join(', ') || 'لا شيء'}
-الأسئلة منذ آخر تخمين مرفوض: ${session.questionsSinceLastRejectedGuess}
 ===================
 `;
 }
 
 // ============================================================
-// 🔥 normalizeAnswer مع دعم إجابات متقدمة
+// 🔥 normalizeAnswer
 // ============================================================
 function normalizeAnswer(answer) {
   const map = {
@@ -205,51 +186,32 @@ function normalizeAnswer(answer) {
     no: 'no',
     maybe: 'maybe',
     dontKnow: 'dont_know',
-    dont_know: 'dont_know',
-    partially: 'partially',
-    sometimes: 'sometimes'
+    dont_know: 'dont_know'
   };
   return map[answer] || 'dont_know';
 }
 
 // ============================================================
-// 🔥 fallback questions ذكية
+// 🔥 fallback questions — كلها نعم/لا فقط
 // ============================================================
 function shortFallbackQuestion(language = 'ar', turnCount = 0, rejectedGuesses = []) {
-  // إذا كان فيه تخمينات مرفوضة، اسأل أسئلة مختلفة
-  if (rejectedGuesses.length > 0) {
-    const arAdvanced = [
-      'ما هي الجنسية؟',
-      'هل لا يزال على قيد الحياة؟',
-      'في أي عصر اشتهر؟',
-      'هل حصل على جوائز عالمية؟',
-      'ما هو المجال الدقيق؟'
-    ];
-    
-    const enAdvanced = [
-      'What is the nationality?',
-      'Are they still alive?',
-      'In which era did they become famous?',
-      'Did they win global awards?',
-      'What is the specific field?'
-    ];
-    
-    const list = language === 'ar' ? arAdvanced : enAdvanced;
-    return list[Math.min(turnCount % list.length, list.length - 1)];
-  }
-  
-  const ar = [
-    'هل هو رجل؟',
+  // أسئلة نعم/لا فقط
+  const arQuestions = [
+    'هل هو ذكر؟',
     'هل هو حقيقي؟',
     'هل هو ممثل؟',
     'هل هو عربي؟',
     'هل هو حي؟',
     'هل هو مغني؟',
     'هل هو رياضي؟',
-    'هل هو سياسي؟'
+    'هل هو سياسي؟',
+    'هل هو مشهور عالمياً؟',
+    'هل هو من العصر الحديث؟',
+    'هل حصل على جوائز؟',
+    'هل هو من هوليوود؟'
   ];
 
-  const en = [
+  const enQuestions = [
     'Is it male?',
     'Is it real?',
     'Is it an actor?',
@@ -257,36 +219,59 @@ function shortFallbackQuestion(language = 'ar', turnCount = 0, rejectedGuesses =
     'Is it alive?',
     'Is it a singer?',
     'Is it an athlete?',
-    'Is it a politician?'
+    'Is it a politician?',
+    'Is it globally famous?',
+    'Is it from modern era?',
+    'Did they win awards?',
+    'Is it from Hollywood?'
   ];
 
-  const list = language === 'ar' ? ar : en;
+  const list = language === 'ar' ? arQuestions : enQuestions;
   return list[Math.min(turnCount, list.length - 1)];
 }
 
 // ============================================================
-// 🔥 fallback guess ذكي
+// 🔥 fallback guess
 // ============================================================
 function fallbackGuess(language = 'ar', rejectedGuesses = []) {
-  const commonGuesses = {
-    ar: ['محمد صلاح', 'أحمد الشقيري', 'نانسي عجرم', 'عبدالحليم حافظ', 'صلاح الدين'],
-    en: ['Mohamed Salah', 'Elon Musk', 'Taylor Swift', 'Cristiano Ronaldo', 'Albert Einstein']
+  const guesses = {
+    ar: ['محمد صلاح', 'أحمد الشقيري', 'نانسي عجرم', 'عبدالحليم حافظ', 'توم كروز'],
+    en: ['Mohamed Salah', 'Elon Musk', 'Taylor Swift', 'Cristiano Ronaldo', 'Tom Cruise']
   };
   
-  const available = commonGuesses[language].filter(g => !rejectedGuesses.includes(g));
+  const available = guesses[language].filter(g => !rejectedGuesses.includes(g));
   const name = available[0] || (language === 'ar' ? 'محمد صلاح' : 'Mohamed Salah');
   
   return { 
     type: 'guess', 
     name, 
-    confidence: 0.45,
-    reasoning: 'تخمين احتياطي بناءً على الأنماط الشائعة'
+    confidence: 0.5,
+    reasoning: 'تخمين احتياطي'
   };
 }
 
 // ============================================================
-// 🔥 فلاتر الأسئلة المتقدمة
+// 🔥 فلاتر — تمنع الأسئلة المفتوحة
 // ============================================================
+function isOpenEndedQuestion(text = '', language = 'ar') {
+  const lower = String(text).toLowerCase();
+  
+  // كلمات تدل على سؤال مفتوح
+  const openEndedPatterns = {
+    ar: [
+      'أي', 'كم', 'متى', 'أين', 'كيف', 'لماذا', 'ما هي', 'ما هو',
+      'أي حقبة', 'أي عصر', 'كم عمر', 'من أين', 'أي جنسية', 'أي مجال'
+    ],
+    en: [
+      'what', 'when', 'where', 'why', 'how', 'which', 'how old', 
+      'what era', 'what nationality', 'what field'
+    ]
+  };
+  
+  const patterns = language === 'ar' ? openEndedPatterns.ar : openEndedPatterns.en;
+  return patterns.some(pattern => lower.includes(pattern));
+}
+
 function isQuestionTooLong(text = '', language = 'ar') {
   const words = String(text).trim().split(/\s+/).filter(Boolean);
   return language === 'ar' ? words.length > 6 : words.length > 8;
@@ -294,25 +279,12 @@ function isQuestionTooLong(text = '', language = 'ar') {
 
 function looksLikeNameQuestion(text = '') {
   const lower = String(text).toLowerCase().trim();
-  if (!lower) return false;
-
-  const namePatterns = [
-    'is it ', 'could it be ', 'هل هو', 'هل اسمه',
-    'مايكل', 'michael', 'محمد', 'tom', 'أحمد', 'علي'
-  ];
-  
-  return namePatterns.some(pattern => lower.includes(pattern)) && 
-         lower.split(/\s+/).length > 3;
-}
-
-function isQuestionIrrelevant(text = '', turnCount = 0) {
-  const irrelevant = ['الطقس', 'اللون', 'الطعام', 'weather', 'color', 'food'];
-  const lower = text.toLowerCase();
-  return irrelevant.some(word => lower.includes(word));
+  const namePatterns = ['is it ', 'could it be ', 'هل هو', 'هل اسمه', 'مايكل', 'michael', 'محمد'];
+  return namePatterns.some(pattern => lower.includes(pattern)) && lower.split(/\s+/).length > 3;
 }
 
 // ============================================================
-// 🔥 sanitizeEngineResult المحسن
+// 🔥 sanitizeEngineResult — يمنع الأسئلة المفتوحة نهائياً
 // ============================================================
 function sanitizeEngineResult(result, session) {
   const turnCount = session.turns.length;
@@ -327,8 +299,16 @@ function sanitizeEngineResult(result, session) {
   if (result.type === 'question') {
     const text = String(result.text || '').trim();
 
-    if (!text || isQuestionTooLong(text, session.language) || 
-        looksLikeNameQuestion(text) || isQuestionIrrelevant(text, turnCount)) {
+    // منع الأسئلة المفتوحة
+    if (isOpenEndedQuestion(text, session.language)) {
+      console.log(`🚫 Blocked open-ended question: ${text}`);
+      return {
+        type: 'question',
+        text: shortFallbackQuestion(session.language, turnCount, session.rejectedGuesses)
+      };
+    }
+
+    if (!text || isQuestionTooLong(text, session.language) || looksLikeNameQuestion(text)) {
       return {
         type: 'question',
         text: shortFallbackQuestion(session.language, turnCount, session.rejectedGuesses)
@@ -341,7 +321,6 @@ function sanitizeEngineResult(result, session) {
   if (result.type === 'guess') {
     const name = String(result.name || '').trim();
     const confidence = typeof result.confidence === 'number' ? result.confidence : 0.5;
-    const reasoning = result.reasoning || '';
 
     if (!name || session.rejectedGuesses.includes(name)) {
       return {
@@ -350,12 +329,7 @@ function sanitizeEngineResult(result, session) {
       };
     }
 
-    return {
-      type: 'guess',
-      name,
-      confidence,
-      reasoning
-    };
+    return { type: 'guess', name, confidence };
   }
 
   return {
@@ -365,7 +339,7 @@ function sanitizeEngineResult(result, session) {
 }
 
 // ============================================================
-// 🔥 forceGuess مع تحليل الثقة
+// 🔥 forceGuess
 // ============================================================
 async function forceGuess(session) {
   if (!openai) {
@@ -379,13 +353,7 @@ async function forceGuess(session) {
     messages: [
       {
         role: 'system',
-        content: `
-قم بتقديم أفضل تخمين لديك الآن بناءً على المعلومات المتاحة.
-حلل الثقة بدقة واستخدم حقل reasoning.
-
-التنسيق:
-{"type":"guess","name":"...","confidence":0.XX,"reasoning":"تحليل مختصر"}
-`
+        content: 'قم بتقديم أفضل تخمين لديك الآن. أخرج JSON صارماً فقط. التنسيق: {"type":"guess","name":"...","confidence":0.XX}'
       },
       {
         role: 'user',
@@ -395,9 +363,9 @@ async function forceGuess(session) {
 حالة اللعبة:
 ${sessionMessages(session)}
 
-التخمينات المرفوضة سابقاً: ${session.rejectedGuesses.join(', ') || 'لا شيء'}
+التخمينات المرفوضة: ${session.rejectedGuesses.join(', ') || 'لا شيء'}
 
-قم بتقديم أفضل تخمين واحد الآن مع تحليل الثقة.
+قدم أفضل تخمين واحد الآن.
 `
       }
     ]
@@ -414,14 +382,13 @@ ${sessionMessages(session)}
 }
 
 // ============================================================
-// 🔥 askEngine — قلب الذكاء (نسخة 10/10)
+// 🔥 askEngine — مع منع الأسئلة المفتوحة
 // ============================================================
 async function askEngine(session) {
   const turnCount = session.turns.length;
 
-  // تحليل متقدم لمعرفة إذا كان مسموح بالتخمين
+  // منطق التخمين
   let canGuessNow = false;
-  let shouldAskMore = false;
   
   if (turnCount >= MIN_QUESTIONS_BEFORE_GUESS) {
     if (session.rejectedGuesses.length === 0) {
@@ -430,17 +397,14 @@ async function askEngine(session) {
       canGuessNow = true;
     }
   }
-  
-  // إذا كان عندنا تخمينات مرفوضة، حاول تحليل الخطأ أولاً
+
+  // تحليل الخطأ إذا كان فيه تخمين مرفوض جديد
   let errorAnalysis = null;
   if (session.rejectedGuesses.length > 0 && session.questionsSinceLastRejectedGuess === 0) {
     const lastWrongGuess = session.rejectedGuesses[session.rejectedGuesses.length - 1];
     errorAnalysis = await analyzeFailedGuess(session, lastWrongGuess);
   }
 
-  // ============================================================
-  // إذا ماكو OpenAI — fallback ذكي
-  // ============================================================
   if (!openai) {
     if (turnCount < MIN_QUESTIONS_BEFORE_GUESS || !canGuessNow) {
       return {
@@ -451,12 +415,9 @@ async function askEngine(session) {
     return fallbackGuess(session.language, session.rejectedGuesses);
   }
 
-  // ============================================================
-  // 🔥 الذكاء الحقيقي — OpenAI مع تحليل متقدم
-  // ============================================================
   const response = await openai.chat.completions.create({
     model,
-    temperature: 0.12,
+    temperature: 0.1,
     response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: makeSystemPrompt(session.language) },
@@ -470,24 +431,19 @@ ${sessionMessages(session)}
 
 ${errorAnalysis ? `=== تحليل الخطأ السابق ===\n${JSON.stringify(errorAnalysis, null, 2)}\n========================\n` : ''}
 
-التخمينات المرفوضة: ${session.rejectedGuesses.join(', ') || 'لا شيء'}
+🚨 قواعد صارمة جداً 🚨
+1. كل سؤال يجب أن يكون من نوع "نعم/لا" فقط.
+2. لا تسأل أبداً: أي، كم، متى، أين، كيف، لماذا.
+3. لا تسأل عن "أي حقبة" أو "أي جنسية" — اسأل "هل هو من العصر الحديث؟" بدلاً من ذلك.
+4. إذا كنت ستخمن، تأكد أن الثقة أعلى من ${CONFIDENCE_THRESHOLD}.
 
-=== قرارات مهمة ===
-- عدد الأسئلة المتبقية قبل الحد الأقصى: ${Math.max(0, MAX_QUESTIONS_BEFORE_GUESS - turnCount)}
-- ${canGuessNow ? '✅ مسموح لك بالتخمين الآن إذا كانت الثقة عالية' : '❌ لا تخمن الآن، استمر في طرح الأسئلة'}
-- ${CONFIDENCE_THRESHOLD > 0 ? `⚠️ لا تخمن除非 الثقة أعلى من ${CONFIDENCE_THRESHOLD * 100}%` : ''}
+${canGuessNow ? '✅ يمكنك التخمين الآن إذا كنت واثقاً' : '❌ لا تخمن الآن، اسأل سؤال نعم/لا بدلاً من ذلك'}
 
-${errorAnalysis ? `
-استراتيجية مقترحة بناءً على تحليل الخطأ:
-- تجنب التخمين: ${errorAnalysis.suggestedGuess || 'غير محدد'}
-- ركز على: ${errorAnalysis.missingInfo?.join(', ') || 'جمع معلومات إضافية'}
-` : ''}
+عدد الأسئلة المتبقية: ${Math.max(0, MAX_QUESTIONS_BEFORE_GUESS - turnCount)}
 
-اتخذ القرار الآن:
-- إذا كنت واثقاً (ثقة > ${CONFIDENCE_THRESHOLD * 100}%) وقد حان وقت التخمين → خمن
-- وإلا → اسأل سؤالاً قوياً ومحدداً
+${errorAnalysis ? `أسئلة مقترحة من تحليل الخطأ: ${errorAnalysis.nextQuestions?.join(', ') || ''}` : ''}
 
-تذكر: الجودة أهم من السرعة!
+قرر الآن: سؤال نعم/لا أو تخمين؟
 `
       }
     ]
@@ -499,7 +455,6 @@ ${errorAnalysis ? `
     const parsed = JSON.parse(raw);
     const result = sanitizeEngineResult(parsed, session);
 
-    // إذا AI حاول يخمّن قبل الوقت أو الثقة منخفضة
     if (result.type === 'guess') {
       if (!canGuessNow) {
         return {
@@ -507,28 +462,23 @@ ${errorAnalysis ? `
           text: shortFallbackQuestion(session.language, turnCount, session.rejectedGuesses)
         };
       }
-      
-      // التحقق من الثقة
       if (result.confidence < CONFIDENCE_THRESHOLD && turnCount < MAX_QUESTIONS_BEFORE_GUESS) {
         return {
           type: 'question',
-          text: `هل يمكنك توضيح ${session.language === 'ar' ? 'المجال الدقيق' : 'the specific field'}؟`
+          text: shortFallbackQuestion(session.language, turnCount, session.rejectedGuesses)
         };
       }
     }
 
-    // إذا وصلنا الحد الأقصى للأسئلة — لازم نخمن
     if (result.type === 'question' && turnCount >= MAX_QUESTIONS_BEFORE_GUESS) {
       return await forceGuess(session);
     }
 
     return result;
-  } catch (error) {
-    console.error('Error parsing AI response:', error);
+  } catch {
     if (turnCount >= MAX_QUESTIONS_BEFORE_GUESS) {
       return await forceGuess(session);
     }
-
     return {
       type: 'question',
       text: shortFallbackQuestion(session.language, turnCount, session.rejectedGuesses)
@@ -537,23 +487,21 @@ ${errorAnalysis ? `
 }
 
 // ============================================================
-// 🔥 Wikipedia Fetch مع Cache
+// 🔥 Wikipedia Fetch
 // ============================================================
 const wikiCache = new Map();
 
 async function fetchWikipediaSummary(name, language = 'ar') {
   const cacheKey = `${name}:${language}`;
-  if (wikiCache.has(cacheKey)) {
-    return wikiCache.get(cacheKey);
-  }
+  if (wikiCache.has(cacheKey)) return wikiCache.get(cacheKey);
 
   const lang = language === 'ar' ? 'ar' : 'en';
   const title = encodeURIComponent(name.replace(/ /g, '_'));
   const url = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${title}`;
 
   const res = await fetch(url);
-
   let result;
+
   if (!res.ok) {
     result = {
       title: name,
@@ -572,27 +520,17 @@ async function fetchWikipediaSummary(name, language = 'ar') {
   }
   
   wikiCache.set(cacheKey, result);
-  setTimeout(() => wikiCache.delete(cacheKey), 3600000); // Cache for 1 hour
-  
+  setTimeout(() => wikiCache.delete(cacheKey), 3600000);
   return result;
 }
 
 // ============================================================
-// 🔥 API: /api/health
+// 🔥 APIs
 // ============================================================
 app.get('/api/health', (_req, res) => {
-  res.json({ 
-    ok: true, 
-    model, 
-    hasOpenAI: Boolean(openai),
-    activeSessions: sessions.size,
-    version: '10/10 Ultimate Edition'
-  });
+  res.json({ ok: true, model, hasOpenAI: Boolean(openai), activeSessions: sessions.size });
 });
 
-// ============================================================
-// 🔥 API: Start Game
-// ============================================================
 app.post('/api/game/start', async (req, res) => {
   try {
     const language = req.body?.language === 'en' ? 'en' : 'ar';
@@ -619,9 +557,6 @@ app.post('/api/game/start', async (req, res) => {
   }
 });
 
-// ============================================================
-// 🔥 API: Answer Question
-// ============================================================
 app.post('/api/game/answer', async (req, res) => {
   try {
     const { sessionId, question, answer } = req.body || {};
@@ -646,9 +581,6 @@ app.post('/api/game/answer', async (req, res) => {
   }
 });
 
-// ============================================================
-// 🔥 API: Confirm Guess
-// ============================================================
 app.post('/api/game/guess-confirm', async (req, res) => {
   try {
     const { sessionId, guessName, correct } = req.body || {};
@@ -659,27 +591,12 @@ app.post('/api/game/guess-confirm', async (req, res) => {
     }
 
     if (correct) {
-      const wiki = await fetchWikipediaSummary(
-        String(guessName || ''),
-        session.language
-      );
-
-      return res.json({
-        type: 'revealed',
-        guessName,
-        wiki
-      });
+      const wiki = await fetchWikipediaSummary(String(guessName || ''), session.language);
+      return res.json({ type: 'revealed', guessName, wiki });
     }
 
-    // تخمين خاطئ - تحليل عميق وتعلم من الخطأ
     session.rejectedGuesses.push(String(guessName || ''));
     session.questionsSinceLastRejectedGuess = 0;
-    
-    // تحليل الخطأ لتحسين التخمينات المستقبلية
-    const analysis = await analyzeFailedGuess(session, guessName);
-    if (analysis) {
-      console.log(`📊 Analysis for ${guessName}:`, analysis.reason);
-    }
 
     const result = await askEngine(session);
     return res.json(result);
@@ -689,18 +606,11 @@ app.post('/api/game/guess-confirm', async (req, res) => {
   }
 });
 
-// ============================================================
-// 🔥 API: Wikipedia Search
-// ============================================================
 app.get('/api/wiki', async (req, res) => {
   try {
     const name = String(req.query.name || '');
     const language = req.query.language === 'en' ? 'en' : 'ar';
-
-    if (!name) {
-      return res.status(400).json({ error: 'name is required' });
-    }
-
+    if (!name) return res.status(400).json({ error: 'name is required' });
     const wiki = await fetchWikipediaSummary(name, language);
     res.json(wiki);
   } catch (error) {
@@ -710,26 +620,7 @@ app.get('/api/wiki', async (req, res) => {
 });
 
 // ============================================================
-// 🔥 API: Session Stats
-// ============================================================
-app.get('/api/session/:sessionId', (req, res) => {
-  const session = sessions.get(req.params.sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  
-  res.json({
-    id: session.id,
-    language: session.language,
-    turnsCount: session.turns.length,
-    rejectedGuesses: session.rejectedGuesses,
-    createdAt: session.createdAt,
-    lastActivity: session.lastActivity
-  });
-});
-
-// ============================================================
-// 🔥 Cleanup old sessions (every hour)
+// 🔥 Cleanup
 // ============================================================
 setInterval(() => {
   const now = new Date();
@@ -737,30 +628,23 @@ setInterval(() => {
     const hoursSinceLastActivity = (now - session.lastActivity) / (1000 * 60 * 60);
     if (hoursSinceLastActivity > 24) {
       sessions.delete(id);
-      console.log(`🧹 Cleaned up old session: ${id}`);
     }
   }
   backupSessions();
 }, 60 * 60 * 1000);
 
 // ============================================================
-// 🔥 Load sessions on startup
+// 🔥 Start
 // ============================================================
 loadSessions().then(() => {
-  console.log(`🚀 Server ready with ${sessions.size} sessions loaded`);
-});
-
-// ============================================================
-// 🔥 تشغيل السيرفر
-// ============================================================
-app.listen(port, () => {
-  console.log(`
+  app.listen(port, () => {
+    console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║  🎯 AI Character Guessing Engine - 10/10 Ultimate      ║
+║  🎯 AI Character Guessing Engine - FINAL 10/10          ║
 ║  🔥 Running on: http://localhost:${port}                    ║
-║  🤖 Model: ${model}                                         ║
-║  💾 Sessions: Active with persistence                   ║
+║  🚫 ONLY YES/NO QUESTIONS ALLOWED                       ║
 ║  🧠 Confidence Threshold: ${CONFIDENCE_THRESHOLD * 100}%                     ║
 ╚══════════════════════════════════════════════════════════╝
-  `);
+    `);
+  });
 });
