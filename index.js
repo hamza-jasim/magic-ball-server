@@ -361,8 +361,9 @@ async function askEngine(session) {
   }
 
   return sanitizeEngineResult(parsed, session);
-}
+  }
 
+}
 
   // ============================================================
   // إذا ماكو OpenAI — fallback بسيط
