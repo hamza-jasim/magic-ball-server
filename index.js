@@ -314,8 +314,9 @@ Make the best single guess now.
 async function askEngine(session) {
   const turnCount = session.turns.length;
 
+  // يمنع التخمين بعد أول رفض
   const canGuessNow =
-    session.rejectedGuesses.length === 0 && // يمنع التخمين بعد أول رفض
+    session.rejectedGuesses.length === 0 &&
     turnCount >= MIN_QUESTIONS_BEFORE_GUESS &&
     session.questionsSinceLastRejectedGuess >= QUESTIONS_AFTER_REJECTED_GUESS;
 
@@ -342,8 +343,9 @@ async function askEngine(session) {
     parsed = { type: "question", text: shortFallbackQuestion(session.language, turnCount) };
   }
 
-  // إذا الذكاء حاول يخمّن بعد أول رفض → نحوله سؤال
+  // إذا اللاعب رفض التخمين الأول → امنع التخمين نهائياً
   if (session.rejectedGuesses.length > 0 && parsed.type === "guess") {
+    // نحوله سؤال جديد
     return {
       type: "question",
       text: shortFallbackQuestion(session.language, turnCount)
@@ -360,6 +362,7 @@ async function askEngine(session) {
 
   return sanitizeEngineResult(parsed, session);
 }
+
 
   // ============================================================
   // إذا ماكو OpenAI — fallback بسيط
