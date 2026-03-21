@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import OpenAI from 'openai';
 import crypto from 'node:crypto';
 
+// 1. إعدادات البيئة
 dotenv.config();
 
 const app = express();
@@ -13,283 +14,154 @@ app.use(express.json());
 const port = Number(process.env.PORT || 3001);
 const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
+// 2. التحقق من مفتاح OpenAI
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
   : null;
 
+// مخزن الجلسات (في الذاكرة)
 const sessions = new Map();
 
-// GAME RULES
-const MIN_QUESTIONS_BEFORE_GUESS = 7;
-const MAX_QUESTIONS_BEFORE_GUESS = 10;
-const QUESTIONS_AFTER_REJECTED_GUESS = 2;
+// 3. ثوابت اللعبة الصارمة
+const MIN_QUESTIONS = 7;           // لن يخمن أبداً قبل السؤال السابع
+const MAX_QUESTIONS_LIMIT = 25;    // حد أقصى للأسئلة
+const AFTER_FAIL_WAIT = 3;        // كم سؤال يسأل بعد التخمين الخاطئ
 
 /* ============================================================
-   SYSTEM PROMPT
+   التعليمات البرمجية للذكاء الاصطناعي (System Prompt)
    ============================================================ */
-function makeSystemPrompt(language = 'ar') {
-  return `
-You are an ultra‑strategic character‑guessing engine.
-Ask one short yes/no question only.
-Output strict JSON only.
-Never mention names during question mode.
-`;
-}
-
-/* ============================================================
-   HISTORY BUILDER
-   ============================================================ */
-function sessionMessages(session) {
-  const turns = session.turns
-    .map((t, i) => `Q${i + 1}: ${t.question}\nA${i + 1}: ${t.answer}`)
-    .join('\n');
-
-  return `
-Language: ${session.language}
-Turns: ${session.turns.length}
-
-${turns}
-
-Rejected guesses: ${session.rejectedGuesses.join(', ') || 'none'}
-Questions since last rejected guess: ${session.questionsSinceLastRejectedGuess}
-`;
-}
-
-/* ============================================================
-   HELPERS
-   ============================================================ */
-function normalizeAnswer(answer) {
-  const map = {
-    yes: 'yes',
-    no: 'no',
-    maybe: 'maybe',
-    dontKnow: 'dont_know',
-    dont_know: 'dont_know'
-  };
-  return map[answer] || 'dont_know';
-}
-
-function shortFallbackQuestion(language = 'ar', turnCount = 0) {
-  const ar = ['هل هو رجل؟','هل هو حقيقي؟','هل هو ممثل؟','هل هو عربي؟','هل هو حي؟'];
-  const en = ['Is it male?','Is it real?','Is it an actor?','Is it Arab?','Is it alive?'];
-  const list = language === 'ar' ? ar : en;
-  return list[Math.min(turnCount, list.length - 1)];
-}
-
-function fallbackGuess(language = 'ar') {
-  return language === 'ar'
-    ? { type: 'guess', name: 'محمد صلاح', confidence: 0.35 }
-    : { type: 'guess', name: 'Mohamed Salah', confidence: 0.35 };
-}
-
-function isQuestionTooLong(text = '', language = 'ar') {
-  const words = text.trim().split(/\s+/);
-  return language === 'ar' ? words.length > 5 : words.length > 7;
-}
-
-function looksLikeNameQuestion(text = '') {
-  const lower = text.toLowerCase();
-  return lower.startsWith('is it ') || lower.includes('محمد') || lower.includes('michael');
-}
-/* ============================================================
-   SANITIZE RESULT
-   ============================================================ */
-function sanitizeEngineResult(result, session) {
+function getSystemPrompt(session) {
   const turnCount = session.turns.length;
+  // شرط السماح بالتخمين: أن يتجاوز الحد الأدنى ولم يرفض تخمين قريبًا
+  const canGuess = turnCount >= MIN_QUESTIONS && session.questionsSinceLastRejectedGuess >= AFTER_FAIL_WAIT;
 
-  if (!result || typeof result !== 'object') {
-    return { type: 'question', text: shortFallbackQuestion(session.language, turnCount) };
+  return `
+You are a highly intelligent character-guessing AI.
+Current Status:
+- Language: ${session.language === 'ar' ? 'Arabic' : 'English'}
+- Turn Number: ${turnCount}
+- Can you Guess? ${canGuess ? 'YES' : 'NO, ONLY ASK QUESTIONS'}
+- Previously Rejected Names: [${session.rejectedGuesses.join(', ')}]
+
+RULES:
+1. If you are in QUESTION mode: Ask a short, strategic Yes/No question. NEVER mention names.
+2. If you are in GUESS mode: Provide the name of the character you are confident about.
+3. NEVER guess any name from the "Rejected Names" list.
+4. If the user says 'No' to a guess, you must go back to asking questions for at least ${AFTER_FAIL_WAIT} more turns.
+5. RESPONSE FORMAT: You must ALWAYS respond in strict JSON format like this:
+   For a question: {"type": "question", "text": "Is the character real?"}
+   For a guess: {"type": "guess", "name": "Lionel Messi", "confidence": 0.95}
+`;
+}
+
+/* ============================================================
+   محرك معالجة الطلبات
+   ============================================================ */
+async function processAiTurn(session) {
+  if (!openai) {
+    return { type: 'question', text: "API Key is missing!" };
   }
 
-  if (result.type === 'question') {
-    const text = String(result.text || '').trim();
+  try {
+    const response = await openai.chat.completions.create({
+      model: model,
+      messages: [
+        { role: "system", content: getSystemPrompt(session) },
+        { role: "user", content: `Here is the history of our game so far: ${JSON.stringify(session.turns)}` }
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.3 // درجة منخفضة لضمان الدقة وعدم الهلوسة
+    });
 
-    if (!text || isQuestionTooLong(text, session.language) || looksLikeNameQuestion(text)) {
-      return { type: 'question', text: shortFallbackQuestion(session.language, turnCount) };
+    let aiResult = JSON.parse(response.choices[0].message.content);
+
+    // حماية إضافية: إذا حاول الـ AI التخمين قبل السؤال السابع، نجبره على سؤال افتراضي
+    if (session.turns.length < MIN_QUESTIONS && aiResult.type === 'guess') {
+      return { 
+        type: 'question', 
+        text: session.language === 'ar' ? "هل الشخصية حقيقية وليست خيالية؟" : "Is the character a real person?" 
+      };
     }
 
-    return { type: 'question', text };
-  }
-
-  if (result.type === 'guess') {
-    const name = String(result.name || '').trim();
-    if (!name) return fallbackGuess(session.language);
-
-    return {
-      type: 'guess',
-      name,
-      confidence: typeof result.confidence === 'number' ? result.confidence : 0.6
+    return aiResult;
+  } catch (error) {
+    console.error("OpenAI Error:", error);
+    return { 
+      type: 'question', 
+      text: session.language === 'ar' ? "حدث خطأ، هل يمكننا المتابعة؟" : "An error occurred, can we continue?" 
     };
   }
-
-  return { type: 'question', text: shortFallbackQuestion(session.language, turnCount) };
 }
 
 /* ============================================================
-   FORCE GUESS
+   المسارات (API Endpoints)
    ============================================================ */
-async function forceGuess(session) {
-  if (!openai) return fallbackGuess(session.language);
 
-  const response = await openai.chat.completions.create({
-    model,
-    temperature: 0.15,
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: `Make your best guess now.` },
-      { role: 'user', content: sessionMessages(session) }
-    ]
-  });
-
-  const raw = response.choices[0]?.message?.content || '{}';
-  try {
-    return sanitizeEngineResult(JSON.parse(raw), session);
-  } catch {
-    return fallbackGuess(session.language);
-  }
-}
-
-/* ============================================================
-   ASK ENGINE — النسخة الصحيحة الوحيدة
-   ============================================================ */
-async function askEngine(session) {
-  const turnCount = session.turns.length;
-
-  const canGuessNow =
-    session.rejectedGuesses.length === 0 &&
-    turnCount >= MIN_QUESTIONS_BEFORE_GUESS &&
-    session.questionsSinceLastRejectedGuess >= QUESTIONS_AFTER_REJECTED_GUESS;
-
-  if (!openai) return fallbackEngine(session);
-
-  const response = await openai.chat.completions.create({
-    model,
-    temperature: 0.15,
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: makeSystemPrompt(session.language) },
-      { role: 'user', content: sessionMessages(session) }
-    ]
-  });
-
-  const raw = response.choices[0]?.message?.content || '{}';
-  let parsed;
-
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    parsed = { type: 'question', text: shortFallbackQuestion(session.language, turnCount) };
-  }
-
-  if (session.rejectedGuesses.length > 0 && parsed.type === 'guess') {
-    return { type: 'question', text: shortFallbackQuestion(session.language, turnCount) };
-  }
-
-  if (parsed.type === 'guess' && !canGuessNow) {
-    return { type: 'question', text: shortFallbackQuestion(session.language, turnCount) };
-  }
-
-  const clean = sanitizeEngineResult(parsed, session);
-
-  if (clean.type === 'question' && turnCount >= MAX_QUESTIONS_BEFORE_GUESS) {
-    return await forceGuess(session);
-  }
-
-  return clean;
-}
-
-/* ============================================================
-   FALLBACK ENGINE
-   ============================================================ */
-function fallbackEngine(session) {
-  const list = session.language === 'ar'
-    ? ['هل هو رجل؟','هل هو حقيقي؟','هل هو ممثل؟']
-    : ['Is it male?','Is it real?','Is it an actor?'];
-
-  return {
-    type: 'question',
-    text: list[Math.floor(Math.random() * list.length)]
-  };
-}
-/* ============================================================
-   API: HEALTH
-   ============================================================ */
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, model, hasOpenAI: Boolean(openai) });
-});
-
-/* ============================================================
-   API: START GAME
-   ============================================================ */
+// 1. بدء لعبة جديدة
 app.post('/api/game/start', async (req, res) => {
-  try {
-    const language = req.body?.language === 'en' ? 'en' : 'ar';
-    const sessionId = crypto.randomUUID();
-
-    const session = {
-      id: sessionId,
-      language,
-      turns: [],
-      rejectedGuesses: [],
-      questionsSinceLastRejectedGuess: QUESTIONS_AFTER_REJECTED_GUESS
-    };
-
-    sessions.set(sessionId, session);
-
-    const result = await askEngine(session);
-    res.json({ sessionId, ...result });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to start game' });
-  }
+  const sessionId = crypto.randomUUID();
+  const session = {
+    id: sessionId,
+    language: req.body.language || 'ar',
+    turns: [],
+    rejectedGuesses: [],
+    questionsSinceLastRejectedGuess: 10 // لكي يبدأ وهو مستعد
+  };
+  
+  sessions.set(sessionId, session);
+  const result = await processAiTurn(session);
+  res.json({ sessionId, ...result });
 });
 
-/* ============================================================
-   API: ANSWER
-   ============================================================ */
+// 2. إرسال إجابة (نعم، لا، لا أعلم...)
 app.post('/api/game/answer', async (req, res) => {
-  try {
-    const { sessionId, question, answer } = req.body;
-    const session = sessions.get(sessionId);
+  const { sessionId, question, answer } = req.body;
+  const session = sessions.get(sessionId);
 
-    if (!session) return res.status(404).json({ error: 'Session not found' });
+  if (!session) return res.status(404).json({ error: "Session expired" });
 
-    session.turns.push({ question, answer: normalizeAnswer(answer) });
-    session.questionsSinceLastRejectedGuess++;
+  // إضافة السؤال وإجابة المستخدم للسجل
+  session.turns.push({ question, answer });
+  session.questionsSinceLastRejectedGuess++;
 
-    const result = await askEngine(session);
-    res.json(result);
-  } catch {
-    res.status(500).json({ error: 'Failed to process answer' });
-  }
+  const result = await processAiTurn(session);
+  res.json(result);
 });
 
-/* ============================================================
-   API: CONFIRM GUESS
-   ============================================================ */
+// 3. تأكيد التخمين (هل هو فلان؟)
 app.post('/api/game/guess-confirm', async (req, res) => {
-  try {
-    const { sessionId, guessName, correct } = req.body;
-    const session = sessions.get(sessionId);
+  const { sessionId, correct, guessName } = req.body;
+  const session = sessions.get(sessionId);
 
-    if (!session) return res.status(404).json({ error: 'Session not found' });
+  if (!session) return res.status(404).json({ error: "Session expired" });
 
-    if (correct) {
-      return res.json({ type: 'revealed', guessName });
-    }
-
+  if (correct) {
+    // إذا فاز الذكاء الاصطناعي
+    return res.json({ 
+      type: 'revealed', 
+      message: session.language === 'ar' ? `رائع! لقد عرفت أنها ${guessName}` : `Great! I knew it was ${guessName}` 
+    });
+  } else {
+    // إذا كان التخمين خاطئاً
     session.rejectedGuesses.push(guessName);
-    session.questionsSinceLastRejectedGuess = 0;
+    session.questionsSinceLastRejectedGuess = 0; // تصفير العداد لإجباره على الأسئلة
 
-    const result = await askEngine(session);
+    const result = await processAiTurn(session);
     res.json(result);
-  } catch {
-    res.status(500).json({ error: 'Failed to confirm guess' });
   }
 });
 
-/* ============================================================
-   START SERVER
-   ============================================================ */
+// 4. فحص الحالة
+app.get('/api/health', (req, res) => {
+  res.json({ status: "running", openai: !!openai });
+});
+
+// تشغيل السيرفر
 app.listen(port, () => {
-  console.log(`Magic Ball server running on http://localhost:${port}`);
+  console.log(`
+  ✅ Game Server is running!
+  🚀 Port: ${port}
+  🤖 Model: ${model}
+  -----------------------------------
+  `);
 });
