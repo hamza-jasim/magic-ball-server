@@ -2750,34 +2750,7 @@ function isWeakQuestion(text = '') {
     'well known'
   ];
   
-  // التحقق إذا كان السؤال يطابق أي نمط ضعيف
-  for (const pattern of weakPatterns) {
-    if (lower.includes(pattern)) {
-      return true;
-    }
-  }
-  
-  // التحقق من طول السؤال (الأسئلة القصيرة جداً غالباً ضعيفة)
-  if (lower.length < 10 && (lower.includes('هل') || lower.includes('is') || lower.includes('?'))) {
-    return true;
-  }
-  
-  // التحقق من الأسئلة التي تحتوي على كلمات عامة فقط
-  const generalWords = ['مشهور', 'famous', 'معروف', 'شخص', 'person', 'celebrity'];
-  let generalCount = 0;
-  for (const word of generalWords) {
-    if (lower.includes(word)) {
-      generalCount++;
-    }
-  }
-  if (generalCount >= 2 && lower.split(' ').length <= 5) {
-    return true;
-  }
-  
-  return false;
-}
-```
-
+ 
 المميزات الجديدة:
 
 1. أكثر من 100 نمط للكشف عن الأسئلة الضعيفة
