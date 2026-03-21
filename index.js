@@ -316,7 +316,7 @@ async function askEngine(session) {
 
   // هل مسموح بالتخمين الآن؟
   const canGuessNow =
-    session.rejectedGuesses.length === 0 && // يمنع التخمين بعد أول رفض
+    session.rejectedGuesses.length === 0 &&
     turnCount >= MIN_QUESTIONS_BEFORE_GUESS &&
     session.questionsSinceLastRejectedGuess >= QUESTIONS_AFTER_REJECTED_GUESS;
 
@@ -336,7 +336,7 @@ async function askEngine(session) {
 
   try {
     parsed = JSON.parse(raw);
-  } catch (err) {
+  } catch {
     parsed = {
       type: "question",
       text: shortFallbackQuestion(session.language, turnCount)
@@ -362,39 +362,35 @@ async function askEngine(session) {
   return sanitizeEngineResult(parsed, session);
 }
 
-  // ============================================================
-  // إذا ماكو OpenAI — fallback بسيط
-  // ============================================================
-  if (!openai) {
-    const fallbackQuestions = session.language === 'ar'
-      ? [
-          'هل هو رجل؟',
-          'هل هو حقيقي؟',
-          'هل هو ممثل؟',
-          'هل هو عربي؟',
-          'هل هو حي؟',
-          'هل هو مغني؟',
-          'هل هو رياضي؟'
-        ]
-      : [
-          'Is it male?',
-          'Is it real?',
-          'Is it an actor?',
-          'Is it Arab?',
-          'Is it alive?',
-          'Is it a singer?',
-          'Is it an athlete?'
-        ];
+/* ============================================================
+   🔄 fallback بسيط إذا ماكو OpenAI
+   ============================================================ */
+function fallbackEngine(session) {
+  const fallbackQuestions = session.language === 'ar'
+    ? [
+        'هل هو رجل؟',
+        'هل هو حقيقي؟',
+        'هل هو ممثل؟',
+        'هل هو عربي؟',
+        'هل هو حي؟',
+        'هل هو مغني؟',
+        'هل هو رياضي؟'
+      ]
+    : [
+        'Is it male?',
+        'Is it real?',
+        'Is it an actor?',
+        'Is it Arab?',
+        'Is it alive?',
+        'Is it a singer?',
+        'Is it an athlete?'
+      ];
 
-    if (turnCount < MIN_QUESTIONS_BEFORE_GUESS) {
-      return {
-        type: 'question',
-        text: fallbackQuestions[Math.min(turnCount, fallbackQuestions.length - 1)]
-      };
-    }
-
-    return fallbackGuess(session.language);
-  }
+  return {
+    type: "question",
+    text: fallbackQuestions[Math.floor(Math.random() * fallbackQuestions.length)]
+  };
+}
 
   // ============================================================
   // 🔥 الذكاء الحقيقي — OpenAI
