@@ -255,16 +255,6 @@ function sanitizeEngineResult(result, session) {
     };
   }
 
-// منع التخمين نهائياً بعد أول رفض
-if (session.rejectedGuesses.length > 0) {
-  return {
-    type: 'question',
-    text: shortFallbackQuestion(session.language, turnCount)
-  };
-}
-
-// منع التخمين قبل الوقت
-if (result.type === 'guess' && !canGuessNow) {
   return {
     type: 'question',
     text: shortFallbackQuestion(session.language, turnCount)
@@ -327,6 +317,13 @@ async function askEngine(session) {
   const canGuessNow =
     turnCount >= MIN_QUESTIONS_BEFORE_GUESS &&
     session.questionsSinceLastRejectedGuess >= QUESTIONS_AFTER_REJECTED_GUESS;
+// منع أي تخمين جديد بعد أول رفض
+if (session.rejectedGuesses.length > 0) {
+  return {
+    type: "question",
+    text: shortFallbackQuestion(session.language, turnCount)
+  };
+}
 
   // ============================================================
   // إذا ماكو OpenAI — fallback بسيط
