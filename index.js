@@ -315,14 +315,50 @@ async function askEngine(session) {
   const turnCount = session.turns.length;
 
   const canGuessNow =
+    session.rejectedGuesses.length === 0 && // يمنع التخمين بعد أول رفض
     turnCount >= MIN_QUESTIONS_BEFORE_GUESS &&
     session.questionsSinceLastRejectedGuess >= QUESTIONS_AFTER_REJECTED_GUESS;
-// منع أي تخمين جديد بعد أول رفض
-if (session.rejectedGuesses.length > 0) {
-  return {
-    type: "question",
-    text: shortFallbackQuestion(session.language, turnCount)
-  };
+
+  // نرسل الحالة للذكاء
+  const result = await openai.chat.completions.create({
+    model,
+    temperature: 0.15,
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: makeSystemPrompt(session.language) },
+      {
+        role: "user",
+        content: sessionMessages(session)
+      }
+    ]
+  });
+
+  const raw = result.choices[0]?.message?.content || "{}";
+  let parsed = {};
+
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = { type: "question", text: shortFallbackQuestion(session.language, turnCount) };
+  }
+
+  // إذا الذكاء حاول يخمّن بعد أول رفض → نحوله سؤال
+  if (session.rejectedGuesses.length > 0 && parsed.type === "guess") {
+    return {
+      type: "question",
+      text: shortFallbackQuestion(session.language, turnCount)
+    };
+  }
+
+  // إذا مو وقت التخمين → نحوله سؤال
+  if (parsed.type === "guess" && !canGuessNow) {
+    return {
+      type: "question",
+      text: shortFallbackQuestion(session.language, turnCount)
+    };
+  }
+
+  return sanitizeEngineResult(parsed, session);
 }
 
   // ============================================================
