@@ -345,7 +345,6 @@ async function askEngine(session) {
 
   // إذا اللاعب رفض التخمين الأول → امنع التخمين نهائياً
   if (session.rejectedGuesses.length > 0 && parsed.type === "guess") {
-    // نحوله سؤال جديد
     return {
       type: "question",
       text: shortFallbackQuestion(session.language, turnCount)
@@ -361,8 +360,6 @@ async function askEngine(session) {
   }
 
   return sanitizeEngineResult(parsed, session);
-  }
-
 }
 
   // ============================================================
