@@ -2716,47 +2716,6 @@ function sanitizeEngineResult(result, session) {
   };
 }
 
-async function forceGuess(session) {
-  if (!openai) {
-    return fallbackGuess(session.language, session.turns.length);
-  }
-
-  const rejected = session.rejectedGuesses.length
-    ? `Rejected guesses: ${session.rejectedGuesses.join(', ')}`
-    : 'Rejected guesses: none';
-
-  const response = await openai.chat.completions.create({
-    model,
-    temperature: 0.3,
-    response_format: { type: 'json_object' },
-    messages: [
-      {
-        role: 'system',
-        content: `Make your best single guess now.
-
-IMPORTANT RULES:
-- Do NOT repeat any rejected guess
-- Choose a different person each time
-- Be confident
-
-Return STRICT JSON only.
-
-Format:
-{"type":"guess","name":"...","confidence":0.82}`
-      },
-      {
-        role: 'user',
-        content: `Language: ${session.language === 'ar' ? 'Arabic' : 'English'}
-
-Game state:
-${sessionMessages(session)}
-
-${rejected}
-
-Make the best single guess now.`
-      }
-    ]
-  });
 
   const raw = response.choices[0]?.message?.content || '{}';
 
@@ -2916,7 +2875,6 @@ app.post('/api/game/start', async (req, res) => {
   turns: [],
   rejectedGuesses: [],
   questionsSinceLastRejectedGuess: QUESTIONS_AFTER_REJECTED_GUESS,
-  consecutiveGuessFailures: 0
 };
 
     sessions.set(sessionId, session);
@@ -2968,8 +2926,6 @@ app.post('/api/game/guess-confirm', async (req, res) => {
     if (correct) {
       const wiki = await fetchWikipediaSummary(String(guessName || ''), session.language);
 
-      session.consecutiveGuessFailures = 0;
-
       return res.json({
         type: 'revealed',
         guessName,
@@ -2981,14 +2937,6 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       session.rejectedGuesses.push(String(guessName));
     }
 
-    session.consecutiveGuessFailures = (session.consecutiveGuessFailures || 0) + 1;
-
-    if (session.consecutiveGuessFailures < 3) {
-      const result = await forceGuess(session);
-      return res.json(result);
-    }
-
-    session.consecutiveGuessFailures = 0;
     session.questionsSinceLastRejectedGuess = 0;
 
     const result = await askEngine(session);
