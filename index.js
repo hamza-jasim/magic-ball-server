@@ -314,23 +314,20 @@ Make the best single guess now.
 async function askEngine(session) {
   const turnCount = session.turns.length;
 
-  // يمنع التخمين بعد أول رفض
+  // هل مسموح بالتخمين الآن؟
   const canGuessNow =
-    session.rejectedGuesses.length === 0 &&
+    session.rejectedGuesses.length === 0 && // يمنع التخمين بعد أول رفض
     turnCount >= MIN_QUESTIONS_BEFORE_GUESS &&
     session.questionsSinceLastRejectedGuess >= QUESTIONS_AFTER_REJECTED_GUESS;
 
-  // نرسل الحالة للذكاء
+  // إرسال الحالة للذكاء
   const result = await openai.chat.completions.create({
     model,
     temperature: 0.15,
     response_format: { type: "json_object" },
     messages: [
       { role: "system", content: makeSystemPrompt(session.language) },
-      {
-        role: "user",
-        content: sessionMessages(session)
-      }
+      { role: "user", content: sessionMessages(session) }
     ]
   });
 
@@ -339,8 +336,11 @@ async function askEngine(session) {
 
   try {
     parsed = JSON.parse(raw);
-  } catch {
-    parsed = { type: "question", text: shortFallbackQuestion(session.language, turnCount) };
+  } catch (err) {
+    parsed = {
+      type: "question",
+      text: shortFallbackQuestion(session.language, turnCount)
+    };
   }
 
   // إذا اللاعب رفض التخمين الأول → امنع التخمين نهائياً
