@@ -2717,25 +2717,6 @@ function sanitizeEngineResult(result, session) {
 }
 
 
-  const raw = response.choices[0]?.message?.content || '{}';
-
-  try {
-    const parsed = JSON.parse(raw);
-    return sanitizeEngineResult(parsed, session);
-  } catch {
-    return fallbackGuess(session.language, session.turns.length);
-  }
-}
-  const raw = response.choices[0]?.message?.content || '{}';
-
-  try {
-    const parsed = JSON.parse(raw);
-    return sanitizeEngineResult(parsed, session);
-  } catch {
-    return fallbackGuess(session.language, session.turns.length);
-  }
-}
-
 async function askEngine(session) {
   const turnCount = session.turns.length;
 
