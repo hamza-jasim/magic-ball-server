@@ -2608,168 +2608,17 @@ function isQuestionTooLong(text = '', language = 'ar') {
   return language === 'ar' ? words.length > 6 : words.length > 8;
 }
 
-ممتاز! هسه أوسع isWeakQuestion بشكل كبير عشان تكتشف الأسئلة الضعيفة أو العامة أكثر:
-
-```javascript
-function isWeakQuestion(text = '') {
+ function isWeakQuestion(text = '') {
   const lower = String(text).toLowerCase();
-  
   const weakPatterns = [
-    // أسئلة عامة جداً بالعربية
     'هل هو مشهور',
-    'هل هي مشهورة',
     'هل هذه الشخصية مشهورة',
-    'هل هذه الشخصية معروفة',
-    'هل تعرفه',
-    'هل تعرفها',
-    'هل تعرف هذه الشخصية',
-    'هل هو معروف',
-    'هل هي معروفة',
-    'هل هو شخص مشهور',
-    'هل هي شخصية مشهورة',
-    'هل هو شخصية عامة',
-    'هل هو من المشاهير',
-    'هل هو معروف عالمياً',
-    'هل هو معروف عربياً',
-    'هل هو مشهور في العالم',
-    'هل هو مشهور في الوطن العربي',
-    
-    // أسئلة عامة جداً بالإنجليزية
     'is it famous',
     'is this person famous',
-    'is this personality famous',
     'do you know',
-    'do you know this person',
-    'do you know them',
-    'is it well known',
-    'is it well-known',
-    'is it a celebrity',
-    'is it a famous person',
-    'is it known',
-    'is this celebrity',
-    'is this famous',
-    'is this person well-known',
-    'is it globally famous',
-    'is it internationally famous',
-    
-    // أسئلة تكرارية أو غير مفيدة
-    'هل هو انسان',
-    'هل هي انسانة',
-    'هل هو شخص',
-    'هل هي شخصية',
-    'هل هو حقيقي',
-    'هل هي حقيقية',
-    'is it human',
-    'is it a person',
-    'is it real',
-    'is it a real person',
-    
-    // أسئلة عن التخمين
-    'هل خمنت',
-    'هل توقعت',
-    'هل هذا صحيح',
-    'هل اجابة',
-    'did i guess',
-    'did you guess',
-    'is that correct',
-    'is this right',
-    'am i right',
-    
-    // أسئلة متكررة جداً
-    'هل هو ذكر',
-    'هل هي انثى',
-    'هل هو رجل',
-    'هل هي امرأة',
-    'is it male',
-    'is it female',
-    'is it a man',
-    'is it a woman',
-    
-    // أسئلة عامة عن الجنسية
-    'هل هو عربي',
-    'هل هي عربية',
-    'is it arab',
-    'is it arabic',
-    'هل هو اجنبي',
-    'هل هي اجنبية',
-    'is it foreign',
-    
-    // أسئلة عامة عن المجال
-    'هل هو فنان',
-    'هل هي فنانة',
-    'هل هو ممثل',
-    'هل هي ممثلة',
-    'is it an artist',
-    'is it an actor',
-    'is it an actress',
-    'هل هو مغني',
-    'هل هي مغنية',
-    'is it a singer',
-    'هل هو رياضي',
-    'هل هي رياضية',
-    'is it an athlete',
-    
-    // أسئلة عن الحياة والموت
-    'هل هو حي',
-    'هل هي حية',
-    'هل هو ميت',
-    'هل هي ميتة',
-    'is it alive',
-    'is it dead',
-    'is it deceased',
-    'is it living',
-    
-    // أسئلة فضفاضة
-    'هل يمكنك',
-    'هل تستطيع',
-    'هل تظن',
-    'هل تعتقد',
-    'can you',
-    'do you think',
-    'do you believe',
-    'what about',
-    'what is',
-    
-    // أسئلة مكررة بأشكال مختلفة
-    'هل هو',
-    'هل هي',
-    'هل هذا',
-    'هل هذه',
-    'is it',
-    'is this',
-    'is that',
-    'are you',
-    
-    // أسئلة عامة جداً بدون فائدة
-    'شخص',
-    'person',
-    'celebrity',
-    'مشهور',
-    'famous',
-    'معروف',
-    'well known'
+    'هل تعرفه'
   ];
-  
- 
-المميزات الجديدة:
-
-1. أكثر من 100 نمط للكشف عن الأسئلة الضعيفة
-2. يغطي العربية والإنجليزية
-3. يكشف الأسئلة العامة جداً مثل:
-   · "هل هو مشهور؟"
-   · "هل تعرفه؟"
-   · "is it famous?"
-   · "do you know this person?"
-4. يكشف الأسئلة القصيرة جداً (أقل من 10 أحرف وتحتوي على "هل" أو "is")
-5. يكشف الأسئلة التي تحتوي على كلمات عامة فقط مثل "هل هو شخص مشهور؟"
-6. يصنف الأسئلة الضعيفة إلى فئات:
-   · أسئلة عامة عن الشهرة
-   · أسئلة مكررة
-   · أسئلة عن التخمين
-   · أسئلة قصيرة جداً
-   · أسئلة تحتوي على كلمات عامة فقط
-
-بهذا الشكل، اللعبة ترفض الأسئلة الضعيفة وتحفز اللاعب يسأل أسئلة أكثر تحديداً وفائدة 👌
+   
   return weakPatterns.some((p) => lower.includes(p));
 }
 
