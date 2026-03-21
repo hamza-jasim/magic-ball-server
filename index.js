@@ -2916,6 +2916,7 @@ app.post('/api/game/start', async (req, res) => {
       turns: [],
       rejectedGuesses: [],
       questionsSinceLastRejectedGuess: QUESTIONS_AFTER_REJECTED_GUESS
+consecutiveGuessFailures: 0
     };
 
     sessions.set(sessionId, session);
