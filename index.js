@@ -2721,6 +2721,10 @@ async function forceGuess(session) {
     return fallbackGuess(session.language, session.turns.length);
   }
 
+  const rejected = session.rejectedGuesses.length
+    ? `Rejected guesses: ${session.rejectedGuesses.join(', ')}`
+    : 'Rejected guesses: none';
+
   const response = await openai.chat.completions.create({
     model,
     temperature: 0.3,
@@ -2729,6 +2733,12 @@ async function forceGuess(session) {
       {
         role: 'system',
         content: `Make your best single guess now.
+
+IMPORTANT RULES:
+- Do NOT repeat any rejected guess
+- Choose a different person each time
+- Be confident
+
 Return STRICT JSON only.
 
 Format:
@@ -2741,11 +2751,22 @@ Format:
 Game state:
 ${sessionMessages(session)}
 
+${rejected}
+
 Make the best single guess now.`
       }
     ]
   });
 
+  const raw = response.choices[0]?.message?.content || '{}';
+
+  try {
+    const parsed = JSON.parse(raw);
+    return sanitizeEngineResult(parsed, session);
+  } catch {
+    return fallbackGuess(session.language, session.turns.length);
+  }
+}
   const raw = response.choices[0]?.message?.content || '{}';
 
   try {
@@ -2942,8 +2963,11 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
+    // ✅ إذا التخمين صحيح
     if (correct) {
       const wiki = await fetchWikipediaSummary(String(guessName || ''), session.language);
+
+      session.consecutiveGuessFailures = 0;
 
       return res.json({
         type: 'revealed',
@@ -2952,21 +2976,33 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       });
     }
 
+    // ❌ إذا التخمين غلط
     if (guessName) {
       session.rejectedGuesses.push(String(guessName));
     }
 
+    // 👇 هذا السطر مهم جداً
+    session.consecutiveGuessFailures = (session.consecutiveGuessFailures || 0) + 1;
+
+    // 🔥 يسمح فقط 3 تخمينات متتالية
+    if (session.consecutiveGuessFailures < 3) {
+      const result = await forceGuess(session);
+      return res.json(result);
+    }
+
+    // 🚨 بعد 3 تخمينات → يرجع للأسئلة
+    session.consecutiveGuessFailures = 0;
     session.questionsSinceLastRejectedGuess = 0;
 
     const result = await askEngine(session);
 
     return res.json(result);
+
   } catch (error) {
     console.error('/api/game/guess-confirm error:', error);
     res.status(500).json({ error: 'Failed to confirm guess' });
   }
 });
-
 app.get('/api/wiki', async (req, res) => {
   try {
     const name = String(req.query.name || '');
