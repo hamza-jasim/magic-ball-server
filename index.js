@@ -11,36 +11,38 @@ app.use(cors(), express.json());
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const sessions = new Map();
 
-// إعدادات التحكم بالعقل (Strict Control)
-const START_GUESSING_AFTER = 8; // يبدأ التخمين فقط بعد السؤال الثامن
-const QUESTIONS_AFTER_REJECTION = 4; // إذا أخطأ، يسأل 4 أسئلة إضافية إجبارياً
+// إعدادات التحكم
+const START_GUESSING_AFTER = 8; 
+const QUESTIONS_AFTER_REJECTION = 4;
 
 function generateSystemPrompt(session) {
     const turns = session.turns.length;
-    // شرط التخمين: يجب أن يتجاوز العدد المطلوب + أن يكون قد سأل بما يكفي بعد آخر رفض
     const isAllowedToGuess = turns >= START_GUESSING_AFTER && 
                              session.questionsSinceLastRejectedGuess >= QUESTIONS_AFTER_REJECTION;
+    
+    // تحديد التعليمات بناءً على اللغة
+    const langInstructions = session.language === 'ar' 
+        ? `اللغة: العربية الفصحى. 
+           القواعد: 
+           1. اسأل سؤالاً قصيراً جداً (ماكس 5 كلمات).
+           2. الإجابة بنعم أو لا فقط.
+           3. ممنوع ذكر اسم أي شخصية في الأسئلة.
+           4. لا تخمن إلا إذا كنت متأكداً جداً وبعد السؤال الثامن.`
+        : `Language: English. 
+           Rules: 
+           1. Ask a very short question (max 5 words).
+           2. Yes/No format only.
+           3. NEVER mention any character names in questions.
+           4. Do not guess before turn 8.`;
 
     return `
-You are the world's smartest character-guessing engine.
-CORE RULES:
-1. Current Turn: ${turns}. 
-2. Mode: ${isAllowedToGuess ? 'You may GUESS if 100% sure.' : 'STRICT QUESTION MODE. No names allowed.'}
-3. Forbidden Names (Already rejected): [${session.rejectedGuesses.join(', ')}].
-4. Question Rules: Max 5 words. Yes/No format only. NEVER mention any specific person or character name in a question.
-5. Guessing Rules: Only guess if confidence > 0.9.
+${langInstructions}
+Current Turn: ${turns}. 
+Mode: ${isAllowedToGuess ? 'GUESS_OR_QUESTION' : 'STRICT_QUESTION_ONLY'}.
+Rejected Names: [${session.rejectedGuesses.join(', ')}].
 
-Response Format (JSON only):
-{
-  "type": "question",
-  "text": "Short question here"
-} 
-OR 
-{
-  "type": "guess",
-  "name": "Full Name",
-  "confidence": 0.95
-}`;
+Response Format (JSON):
+{"type": "question", "text": "..."} OR {"type": "guess", "name": "...", "confidence": 0.95}`;
 }
 
 async function askAI(session) {
@@ -49,54 +51,56 @@ async function askAI(session) {
             model: "gpt-4o-mini",
             messages: [
                 { role: "system", content: generateSystemPrompt(session) },
-                { role: "user", content: `History:\n${session.turns.map(t => `Q:${t.question} A:${t.answer}`).join('\n')}\nTask: Next JSON.` }
+                { role: "user", content: `History: ${JSON.stringify(session.turns)}` }
             ],
             response_format: { type: "json_object" },
-            temperature: 0.1 // تقليل العشوائية لأقصى حد
+            temperature: 0.1
         });
 
         let result = JSON.parse(response.choices[0].message.content);
 
-        // حماية برمجية (Hard-Coded Protection)
-        const turnCount = session.turns.length;
-        const waitingAfterReject = session.questionsSinceLastRejectedGuess < QUESTIONS_AFTER_REJECTION;
-
+        // حماية اللغة والمنطق
         if (result.type === 'guess') {
-            // إذا حاول التخمين قبل السؤال 8 أو قبل انتهاء فترة الانتظار بعد الرفض
-            if (turnCount < START_GUESSING_AFTER || waitingAfterReject) {
-                // نجبره على تحويل التخمين لسؤال استراتيجي
-                return { type: "question", text: session.language === 'ar' ? "هل الشخصية حقيقية؟" : "Is it a real person?" };
-            }
-            // إذا خمن اسم تم رفضه سابقاً
-            if (session.rejectedGuesses.includes(result.name)) {
-                return { type: "question", text: session.language === 'ar' ? "هل الشخصية مشهورة حالياً؟" : "Is the person currently famous?" };
+            if (session.turns.length < START_GUESSING_AFTER || session.questionsSinceLastRejectedGuess < QUESTIONS_AFTER_REJECTION) {
+                return { 
+                    type: "question", 
+                    text: session.language === 'ar' ? "هل الشخصية حقيقية؟" : "Is it a real person?" 
+                };
             }
         }
         return result;
     } catch (e) {
-        return { type: "question", text: "هل الشخصية ذكر؟" };
+        return { 
+            type: "question", 
+            text: session.language === 'ar' ? "هل الشخصية ذكر؟" : "Is it male?" 
+        };
     }
 }
 
-// --- API Routes ---
+// --- المسارات (Endpoints) ---
 
 app.post('/api/game/start', async (req, res) => {
     const sessionId = crypto.randomUUID();
+    // هنا نأخذ اللغة من الطلب (ar أو en)
+    const language = req.body.language === 'en' ? 'en' : 'ar';
+    
     const session = {
         id: sessionId,
-        language: req.body.language || 'ar',
+        language: language,
         turns: [],
         rejectedGuesses: [],
         questionsSinceLastRejectedGuess: 10
     };
     sessions.set(sessionId, session);
-    res.json({ sessionId, ...(await askAI(session)) });
+    
+    const result = await askAI(session);
+    res.json({ sessionId, ...result });
 });
 
 app.post('/api/game/answer', async (req, res) => {
     const { sessionId, question, answer } = req.body;
     const session = sessions.get(sessionId);
-    if (!session) return res.status(404).send();
+    if (!session) return res.status(404).send("Session not found");
 
     session.turns.push({ question, answer });
     session.questionsSinceLastRejectedGuess++;
@@ -113,9 +117,9 @@ app.post('/api/game/guess-confirm', async (req, res) => {
         res.json({ type: 'win', name: guessName });
     } else {
         session.rejectedGuesses.push(guessName);
-        session.questionsSinceLastRejectedGuess = 0; // تصفير العداد لإجباره على 4 أسئلة جديدة
+        session.questionsSinceLastRejectedGuess = 0; 
         res.json(await askAI(session));
     }
 });
 
-app.listen(3001, () => console.log("Logic Server Updated & Smart!"));
+app.listen(3001, () => console.log("Bilingual AI Server Running on 3001"));
