@@ -2910,14 +2910,14 @@ app.post('/api/game/start', async (req, res) => {
     const language = req.body?.language === 'en' ? 'en' : 'ar';
     const sessionId = crypto.randomUUID();
 
-    const session = {
-      id: sessionId,
-      language,
-      turns: [],
-      rejectedGuesses: [],
-    questionsSinceLastRejectedGuess: QUESTIONS_AFTER_REJECTED_GUESS,
-consecutiveGuessFailures: 0
-    };
+   const session = {
+  id: sessionId,
+  language,
+  turns: [],
+  rejectedGuesses: [],
+  questionsSinceLastRejectedGuess: QUESTIONS_AFTER_REJECTED_GUESS,
+  consecutiveGuessFailures: 0
+};
 
     sessions.set(sessionId, session);
 
@@ -2944,7 +2944,8 @@ app.post('/api/game/answer', async (req, res) => {
       answer: normalizeAnswer(answer)
     });
 
-    session.questionsSinceLastRejectedGuess += 1;
+ session.questionsSinceLastRejectedGuess += 1;
+session.consecutiveGuessFailures = 0;
 
     const result = await askEngine(session);
 
@@ -2964,7 +2965,6 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    // ✅ إذا التخمين صحيح
     if (correct) {
       const wiki = await fetchWikipediaSummary(String(guessName || ''), session.language);
 
@@ -2977,33 +2977,28 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       });
     }
 
-    // ❌ إذا التخمين غلط
     if (guessName) {
       session.rejectedGuesses.push(String(guessName));
     }
 
-    // 👇 هذا السطر مهم جداً
     session.consecutiveGuessFailures = (session.consecutiveGuessFailures || 0) + 1;
 
-    // 🔥 يسمح فقط 3 تخمينات متتالية
     if (session.consecutiveGuessFailures < 3) {
       const result = await forceGuess(session);
       return res.json(result);
     }
 
-    // 🚨 بعد 3 تخمينات → يرجع للأسئلة
     session.consecutiveGuessFailures = 0;
     session.questionsSinceLastRejectedGuess = 0;
 
     const result = await askEngine(session);
-
     return res.json(result);
-
   } catch (error) {
     console.error('/api/game/guess-confirm error:', error);
     res.status(500).json({ error: 'Failed to confirm guess' });
   }
 });
+
 app.get('/api/wiki', async (req, res) => {
   try {
     const name = String(req.query.name || '');
