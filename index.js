@@ -19,54 +19,67 @@ const openai = process.env.OPENAI_API_KEY
 
 const sessions = new Map();
 
+// GAME RULES
 const MIN_QUESTIONS_BEFORE_GUESS = 7;
 const MAX_QUESTIONS_BEFORE_GUESS = 10;
 const QUESTIONS_AFTER_REJECTED_GUESS = 2;
 
+/* ============================================================
+   🔥 SYSTEM PROMPT — نسخة احترافية جداً
+   ============================================================ */
 function makeSystemPrompt(language = 'ar') {
-  return `You are an elite character guessing engine.
+  return `
+You are an ultra‑strategic character‑guessing engine.
 
-PRIMARY GOAL:
-Identify the character in 7 to 10 questions.
+MISSION:
+Identify the character in 7–10 questions with maximum efficiency.
 
 STRICT RULES:
-- Ask only ONE yes/no question at a time.
-- Allowed answers are: yes, no, maybe, dont_know.
-- Return STRICT JSON only.
-- Never explain your reasoning.
-- Never add extra commentary.
-- Never output markdown.
+- Ask ONE yes/no question only.
+- Output STRICT JSON only.
+- No explanations. No markdown.
+- Never mention names during question mode.
+- Questions must be extremely short and high‑information.
 
-QUESTION STYLE:
-- Questions must be VERY SHORT.
-- Arabic questions should usually be 2 to 6 words.
-- English questions should usually be 2 to 8 words.
-- Prefer direct, high-information questions only.
-- Avoid weak, vague, decorative, or repetitive questions.
+INTELLIGENCE FRAMEWORK:
 
-STRATEGY:
-- Questions 1-3: broad classification only.
-  Use: real/fictional, gender, field.
-- Questions 4-6: narrow quickly.
-  Use: actor, singer, athlete, politician, scientist, Arab, alive, era, nationality.
-- Questions 7-10: move strongly toward the answer.
+LAYER 1 — Broad Classification (Q1–Q3)
+- real vs fictional
+- gender
+- domain (sports, acting, politics, music, science, internet, history)
 
-NAME RESTRICTION:
-- During question mode, NEVER mention any person name.
-- NEVER ask a name-based question.
-- Names are allowed only when making a guess.
+LAYER 2 — Domain Narrowing (Q4–Q6)
+- actor type (film/TV)
+- athlete type (football/basketball/wrestling/etc)
+- singer type (arabic/western)
+- politician type (era/country)
+- scientist type (field)
+- nationality
+- alive/dead
+- era (modern/classic)
+
+LAYER 3 — Identity Convergence (Q7–Q10)
+- region
+- specialty
+- iconic traits
+- achievements
+- signature roles
+- team/club
+- genre
+- decade of fame
+
+QUESTION QUALITY RULES:
+- Every question must eliminate 30–60% of possibilities.
+- Avoid vague questions.
+- Avoid repeating concepts.
+- Avoid decorative words.
+- Avoid low‑impact questions.
 
 GUESSING RULES:
 - Never guess before question 7.
-- You should try to guess between question 7 and question 10.
-- Never continue beyond question 10 without making one guess.
-- Only ONE guess at a time.
-
-IF A GUESS IS REJECTED:
-- Do NOT make another guess immediately.
-- Return to question mode.
-- Ask at least 2 more strong trait-based questions before the next guess.
-- Do not repeat rejected guesses.
+- Must guess between Q7–Q10.
+- After a rejected guess, ask 2 strong trait questions before guessing again.
+- Never repeat a rejected guess.
 
 OUTPUT FORMAT:
 
@@ -74,23 +87,34 @@ Question:
 {"type":"question","text":"..."}
 
 Guess:
-{"type":"guess","name":"...","confidence":0.82}`;
+{"type":"guess","name":"...","confidence":0.82}
+`;
 }
 
+/* ============================================================
+   🔥 تحسين الـ HISTORY — يخلي الـ AI يفهم اللعبة بوضوح
+   ============================================================ */
 function sessionMessages(session) {
-  const transcript = session.turns
-    .map((t, index) => `Q${index + 1}: ${t.question}\nA${index + 1}: ${t.answer}`)
+  const turns = session.turns
+    .map((t, i) => `Q${i + 1}: ${t.question}\nA${i + 1}: ${t.answer}`)
     .join('\n');
 
-  const rejected = session.rejectedGuesses.length
-    ? `Rejected guesses: ${session.rejectedGuesses.join(', ')}`
-    : 'Rejected guesses: none';
+  return `
+=== GAME STATE ===
+Language: ${session.language}
+Turns: ${session.turns.length}
 
-  const afterRejectInfo = `Questions since last rejected guess: ${session.questionsSinceLastRejectedGuess}`;
+${turns}
 
-  return `${transcript}\n${rejected}\n${afterRejectInfo}`;
+Rejected guesses: ${session.rejectedGuesses.join(', ') || 'none'}
+Questions since last rejected guess: ${session.questionsSinceLastRejectedGuess}
+===================
+`;
 }
 
+/* ============================================================
+   🔥 تحسين normalizeAnswer
+   ============================================================ */
 function normalizeAnswer(answer) {
   const map = {
     yes: 'yes',
@@ -99,10 +123,12 @@ function normalizeAnswer(answer) {
     dontKnow: 'dont_know',
     dont_know: 'dont_know'
   };
-
   return map[answer] || 'dont_know';
 }
 
+/* ============================================================
+   🔥 fallback questions — قصيرة وقوية
+   ============================================================ */
 function shortFallbackQuestion(language = 'ar', turnCount = 0) {
   const ar = [
     'هل هو رجل؟',
@@ -113,7 +139,7 @@ function shortFallbackQuestion(language = 'ar', turnCount = 0) {
     'هل هو مغني؟',
     'هل هو رياضي؟',
     'هل هو سياسي؟',
-    'هل هو مشهور جداً؟',
+    'هل هو مشهور؟',
     'هل هو من الفن؟'
   ];
 
@@ -126,42 +152,48 @@ function shortFallbackQuestion(language = 'ar', turnCount = 0) {
     'Is it a singer?',
     'Is it an athlete?',
     'Is it a politician?',
-    'Is it very famous?',
-    'Is it in entertainment?'
+    'Is it famous?',
+    'Is it in arts?'
   ];
 
   const list = language === 'ar' ? ar : en;
   return list[Math.min(turnCount, list.length - 1)];
 }
 
+/* ============================================================
+   🔥 fallback guess
+   ============================================================ */
 function fallbackGuess(language = 'ar') {
   return language === 'ar'
     ? { type: 'guess', name: 'محمد صلاح', confidence: 0.35 }
     : { type: 'guess', name: 'Mohamed Salah', confidence: 0.35 };
 }
 
+/* ============================================================
+   🔥 فلاتر الأسئلة — تمنع الأسئلة الغبية
+   ============================================================ */
 function isQuestionTooLong(text = '', language = 'ar') {
   const words = String(text).trim().split(/\s+/).filter(Boolean);
-  return language === 'ar' ? words.length > 6 : words.length > 8;
+  return language === 'ar' ? words.length > 5 : words.length > 7;
 }
 
 function looksLikeNameQuestion(text = '') {
   const lower = String(text).toLowerCase().trim();
-
   if (!lower) return false;
 
   return (
     lower.startsWith('is it ') ||
     lower.startsWith('could it be ') ||
-    lower.startsWith('is this ') ||
     lower.includes('مايكل') ||
     lower.includes('michael') ||
     lower.includes('محمد') ||
     lower.includes('tom ') ||
-    lower.includes('هل هو ') && lower.split(/\s+/).length > 4
+    (lower.includes('هل هو') && lower.split(/\s+/).length > 4)
   );
 }
-
+/* ============================================================
+   🔥 sanitizeEngineResult — يمنع الأسئلة الغبية + الطويلة + الأسماء
+   ============================================================ */
 function sanitizeEngineResult(result, session) {
   const turnCount = session.turns.length;
 
@@ -172,6 +204,9 @@ function sanitizeEngineResult(result, session) {
     };
   }
 
+  // -------------------------------
+  // إذا كان سؤال
+  // -------------------------------
   if (result.type === 'question') {
     const text = String(result.text || '').trim();
 
@@ -182,6 +217,7 @@ function sanitizeEngineResult(result, session) {
       };
     }
 
+    // سؤال طويل
     if (isQuestionTooLong(text, session.language)) {
       return {
         type: 'question',
@@ -189,6 +225,7 @@ function sanitizeEngineResult(result, session) {
       };
     }
 
+    // سؤال يشبه اسم
     if (looksLikeNameQuestion(text)) {
       return {
         type: 'question',
@@ -196,12 +233,12 @@ function sanitizeEngineResult(result, session) {
       };
     }
 
-    return {
-      type: 'question',
-      text
-    };
+    return { type: 'question', text };
   }
 
+  // -------------------------------
+  // إذا كان تخمين
+  // -------------------------------
   if (result.type === 'guess') {
     const name = String(result.name || '').trim();
 
@@ -212,7 +249,9 @@ function sanitizeEngineResult(result, session) {
     return {
       type: 'guess',
       name,
-      confidence: typeof result.confidence === 'number' ? result.confidence : 0.6
+      confidence: typeof result.confidence === 'number'
+        ? result.confidence
+        : 0.6
     };
   }
 
@@ -222,6 +261,9 @@ function sanitizeEngineResult(result, session) {
   };
 }
 
+/* ============================================================
+   🔥 forceGuess — تخمين ذكي عند الحاجة
+   ============================================================ */
 async function forceGuess(session) {
   if (!openai) {
     return fallbackGuess(session.language);
@@ -229,25 +271,29 @@ async function forceGuess(session) {
 
   const response = await openai.chat.completions.create({
     model,
-    temperature: 0.3,
+    temperature: 0.15,
     response_format: { type: 'json_object' },
     messages: [
       {
         role: 'system',
-        content: `Make your single best guess now.
+        content: `
+Make your single best guess now.
 Return STRICT JSON only.
 
 Format:
-{"type":"guess","name":"...","confidence":0.82}`
+{"type":"guess","name":"...","confidence":0.82}
+`
       },
       {
         role: 'user',
-        content: `Language: ${session.language === 'ar' ? 'Arabic' : 'English'}
+        content: `
+Language: ${session.language === 'ar' ? 'Arabic' : 'English'}
 
 Game state:
 ${sessionMessages(session)}
 
-Make the best single guess now.`
+Make the best single guess now.
+`
       }
     ]
   });
@@ -262,12 +308,19 @@ Make the best single guess now.`
   }
 }
 
+/* ============================================================
+   🔥 askEngine — قلب الذكاء
+   ============================================================ */
 async function askEngine(session) {
   const turnCount = session.turns.length;
+
   const canGuessNow =
     turnCount >= MIN_QUESTIONS_BEFORE_GUESS &&
     session.questionsSinceLastRejectedGuess >= QUESTIONS_AFTER_REJECTED_GUESS;
 
+  // ============================================================
+  // إذا ماكو OpenAI — fallback بسيط
+  // ============================================================
   if (!openai) {
     const fallbackQuestions = session.language === 'ar'
       ? [
@@ -299,15 +352,19 @@ async function askEngine(session) {
     return fallbackGuess(session.language);
   }
 
+  // ============================================================
+  // 🔥 الذكاء الحقيقي — OpenAI
+  // ============================================================
   const response = await openai.chat.completions.create({
     model,
-    temperature: 0.35,
+    temperature: 0.15, // أكثر منطقية
     response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: makeSystemPrompt(session.language) },
       {
         role: 'user',
-        content: `Language: ${session.language === 'ar' ? 'Arabic' : 'English'}
+        content: `
+Language: ${session.language === 'ar' ? 'Arabic' : 'English'}
 
 Game state:
 ${sessionMessages(session)}
@@ -318,7 +375,8 @@ Extra server rules:
 - Guess between question ${MIN_QUESTIONS_BEFORE_GUESS} and question ${MAX_QUESTIONS_BEFORE_GUESS}.
 - If a guess was rejected, ask at least ${QUESTIONS_AFTER_REJECTED_GUESS} more questions before guessing again.
 - Never mention a name in question mode.
-- Prefer strong narrowing questions only.`
+- Prefer strong narrowing questions only.
+`
       }
     ]
   });
@@ -329,6 +387,7 @@ Extra server rules:
     const parsed = JSON.parse(raw);
     const result = sanitizeEngineResult(parsed, session);
 
+    // إذا AI حاول يخمّن قبل الوقت — نرجعه سؤال
     if (result.type === 'guess' && !canGuessNow) {
       return {
         type: 'question',
@@ -336,22 +395,27 @@ Extra server rules:
       };
     }
 
+    // إذا وصلنا الحد الأقصى — لازم نخمن
     if (result.type === 'question' && turnCount >= MAX_QUESTIONS_BEFORE_GUESS) {
       return await forceGuess(session);
     }
 
     return result;
   } catch {
+    // fallback عند خطأ JSON
     if (turnCount >= MAX_QUESTIONS_BEFORE_GUESS) {
       return await forceGuess(session);
     }
 
-    return session.language === 'ar'
-      ? { type: 'question', text: shortFallbackQuestion('ar', turnCount) }
-      : { type: 'question', text: shortFallbackQuestion('en', turnCount) };
+    return {
+      type: 'question',
+      text: shortFallbackQuestion(session.language, turnCount)
+    };
   }
 }
-
+/* ============================================================
+   🔥 Wikipedia Fetch
+   ============================================================ */
 async function fetchWikipediaSummary(name, language = 'ar') {
   const lang = language === 'ar' ? 'ar' : 'en';
   const title = encodeURIComponent(name.replace(/ /g, '_'));
@@ -376,14 +440,21 @@ async function fetchWikipediaSummary(name, language = 'ar') {
     title: json.title || name,
     extract: json.extract || '',
     imageURL: json.thumbnail?.source || null,
-    articleURL: json.content_urls?.desktop?.page || `https://${lang}.wikipedia.org/wiki/${title}`
+    articleURL: json.content_urls?.desktop?.page ||
+      `https://${lang}.wikipedia.org/wiki/${title}`
   };
 }
 
+/* ============================================================
+   🔥 API: /api/health
+   ============================================================ */
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, model, hasOpenAI: Boolean(openai) });
 });
 
+/* ============================================================
+   🔥 API: Start Game
+   ============================================================ */
 app.post('/api/game/start', async (req, res) => {
   try {
     const language = req.body?.language === 'en' ? 'en' : 'ar';
@@ -407,6 +478,9 @@ app.post('/api/game/start', async (req, res) => {
   }
 });
 
+/* ============================================================
+   🔥 API: Answer Question
+   ============================================================ */
 app.post('/api/game/answer', async (req, res) => {
   try {
     const { sessionId, question, answer } = req.body || {};
@@ -431,6 +505,9 @@ app.post('/api/game/answer', async (req, res) => {
   }
 });
 
+/* ============================================================
+   🔥 API: Confirm Guess
+   ============================================================ */
 app.post('/api/game/guess-confirm', async (req, res) => {
   try {
     const { sessionId, guessName, correct } = req.body || {};
@@ -440,8 +517,12 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
+    // إذا التخمين صحيح
     if (correct) {
-      const wiki = await fetchWikipediaSummary(String(guessName || ''), session.language);
+      const wiki = await fetchWikipediaSummary(
+        String(guessName || ''),
+        session.language
+      );
 
       return res.json({
         type: 'revealed',
@@ -450,6 +531,7 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       });
     }
 
+    // إذا التخمين غلط
     session.rejectedGuesses.push(String(guessName || ''));
     session.questionsSinceLastRejectedGuess = 0;
 
@@ -461,6 +543,9 @@ app.post('/api/game/guess-confirm', async (req, res) => {
   }
 });
 
+/* ============================================================
+   🔥 API: Wikipedia Search
+   ============================================================ */
 app.get('/api/wiki', async (req, res) => {
   try {
     const name = String(req.query.name || '');
@@ -478,6 +563,9 @@ app.get('/api/wiki', async (req, res) => {
   }
 });
 
+/* ============================================================
+   🔥 تشغيل السيرفر
+   ============================================================ */
 app.listen(port, () => {
   console.log(`Magic Ball server running on http://localhost:${port}`);
 });
