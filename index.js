@@ -20,59 +20,38 @@ const openai = new OpenAI({
 const sessions = new Map();
 
 function makeSystemPrompt(language = 'ar') {
-  return `You are a highly intelligent character guessing engine.
+  return `You are a smart guessing engine.
 
 GOAL:
-Identify the character in 7 to 10 questions.
+Guess the character in 7–10 questions.
 
-STRICT RULES:
-- Ask ONLY one yes/no question.
-- Questions must be SHORT.
-- Arabic: 3-6 words.
-- English: 3-8 words.
-- Do NOT explain anything.
-
-THINKING STRATEGY:
-1. Build a clear decision tree.
-2. Never change direction randomly.
-3. Always use previous answers.
-4. Each question must eliminate many possibilities.
+RULES:
+- Ask ONE short yes/no question.
+- Do NOT repeat questions.
+- Do NOT contradict previous answers.
+- Stay in same logical direction.
 
 ORDER:
-1- Real or fictional
-2- Gender
-3- Profession group
-4- Nationality
-5- Alive or dead
-6- Narrow deeper
-7- Move to guess
+1. Real or fictional
+2. Gender
+3. Profession
+4. Nationality
+5. Alive or dead
+6. Narrow more
 
-CRITICAL:
-- NEVER repeat a question.
-- NEVER ask the same idea again.
-- NEVER contradict previous answers.
-- NEVER jump to a new category randomly.
-
-GUESSING:
-- Do NOT guess before question 7.
-- MUST guess between 7 and 10.
-- ONLY ONE guess.
-
-IF WRONG:
-- Return to questions.
-- Ask at least 2 new questions.
-- Do NOT guess immediately again.
+GUESS:
+- Only after 7 questions
+- Max 3 guesses
+- After 3 wrong → return to questions
 
 LANGUAGE:
-- Arabic ONLY if ar
-- English ONLY if en
+- Arabic if ar
+- English if en
 
-OUTPUT STRICT JSON:
+OUTPUT JSON:
 
-Question:
 {"type":"question","text":"..."}
-
-Guess:
+or
 {"type":"guess","name":"...","confidence":0.85}`;
 }
 
@@ -93,19 +72,16 @@ function normalizeAnswer(answer) {
   return map[answer] || 'dont_know';
 }
 
-function isDuplicateQuestion(newQ, session) {
-  return session.turns.some(t =>
-    t.question.trim() === newQ.trim()
-  );
-}
-
 function getFallbackQuestion(language, step) {
   const ar = [
     'هل هذه شخصية حقيقية؟',
     'هل هو رجل؟',
     'هل هو فنان؟',
     'هل هو عربي؟',
-    'هل هو حي؟'
+    'هل هو حي؟',
+    'هل هو ممثل؟',
+    'هل هو مغني؟',
+    'هل هو رياضي؟'
   ];
 
   const en = [
@@ -113,11 +89,18 @@ function getFallbackQuestion(language, step) {
     'Is this person male?',
     'Is this person an artist?',
     'Is this person Arab?',
-    'Is this person alive?'
+    'Is this person alive?',
+    'Is this person an actor?',
+    'Is this person a singer?',
+    'Is this person an athlete?'
   ];
 
   const list = language === 'ar' ? ar : en;
   return list[step % list.length];
+}
+
+function isDuplicate(q, session) {
+  return session.turns.some(t => t.question.trim() === q.trim());
 }
 
 async function askEngine(session) {
@@ -129,27 +112,14 @@ async function askEngine(session) {
       { role: 'system', content: makeSystemPrompt(session.language) },
       {
         role: 'user',
-        content: `Language: ${session.language}
-
-Game state:
-${sessionMessages(session)}
-
-INSTRUCTIONS:
-- Follow strict logic.
-- Use previous answers.
-- Stay in same direction.
-- Do not repeat or contradict.
-
-Generate next step.`
+        content: `Game state:\n${sessionMessages(session)}`
       }
     ]
   });
 
-  let raw = response.choices[0]?.message?.content || '{}';
-
   let parsed;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(response.choices[0].message.content);
   } catch {
     return {
       type: 'question',
@@ -157,21 +127,25 @@ Generate next step.`
     };
   }
 
-  // منع التكرار
+  // منع تكرار السؤال
   if (parsed.type === 'question') {
-    if (!parsed.text || parsed.text.length < 3) {
+    if (!parsed.text || isDuplicate(parsed.text, session)) {
       return {
         type: 'question',
         text: getFallbackQuestion(session.language, session.turns.length)
       };
     }
+  }
 
-    if (isDuplicateQuestion(parsed.text, session)) {
-      return {
-        type: 'question',
-        text: getFallbackQuestion(session.language, session.turns.length)
-      };
-    }
+  // منع إعادة نفس التخمين
+  if (
+    parsed.type === 'guess' &&
+    session.rejectedGuesses.includes(parsed.name)
+  ) {
+    return {
+      type: 'question',
+      text: getFallbackQuestion(session.language, session.turns.length)
+    };
   }
 
   return parsed;
@@ -211,7 +185,8 @@ app.post('/api/game/start', async (req, res) => {
     id: sessionId,
     language,
     turns: [],
-    rejectedGuesses: []
+    rejectedGuesses: [],
+    guessStreak: 0
   };
 
   sessions.set(sessionId, session);
@@ -233,6 +208,8 @@ app.post('/api/game/answer', async (req, res) => {
     question,
     answer: normalizeAnswer(answer)
   });
+
+  session.guessStreak = 0;
 
   const result = await askEngine(session);
 
@@ -258,10 +235,15 @@ app.post('/api/game/guess-confirm', async (req, res) => {
   }
 
   session.rejectedGuesses.push(guessName);
+  session.guessStreak++;
 
-  const result = await askEngine(session);
+  // يسمح فقط 3 تخمينات
+  if (session.guessStreak >= 3) {
+    session.guessStreak = 0;
+    return res.json(await askEngine(session));
+  }
 
-  res.json(result);
+  return res.json(await askEngine(session));
 });
 
 app.listen(port, () => {
