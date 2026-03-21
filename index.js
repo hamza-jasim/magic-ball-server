@@ -255,6 +255,16 @@ function sanitizeEngineResult(result, session) {
     };
   }
 
+// منع التخمين نهائياً بعد أول رفض
+if (session.rejectedGuesses.length > 0) {
+  return {
+    type: 'question',
+    text: shortFallbackQuestion(session.language, turnCount)
+  };
+}
+
+// منع التخمين قبل الوقت
+if (result.type === 'guess' && !canGuessNow) {
   return {
     type: 'question',
     text: shortFallbackQuestion(session.language, turnCount)
