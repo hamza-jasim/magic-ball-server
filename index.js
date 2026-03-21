@@ -2915,7 +2915,7 @@ app.post('/api/game/start', async (req, res) => {
       language,
       turns: [],
       rejectedGuesses: [],
-      questionsSinceLastRejectedGuess: QUESTIONS_AFTER_REJECTED_GUESS
+    questionsSinceLastRejectedGuess: QUESTIONS_AFTER_REJECTED_GUESS,
 consecutiveGuessFailures: 0
     };
 
