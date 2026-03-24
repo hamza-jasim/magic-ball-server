@@ -732,14 +732,16 @@ app.post('/api/game/start', async (req, res) => {
     const sessionId = crypto.randomUUID();
 
     const session = {
-      id: sessionId,
-      language,
-      turns: [],
-      rejectedGuesses: [],
-      guessStreak: 0,
-      questionsSincePhaseReset: 0,
-      minQuestionsBeforeGuess: INITIAL_MIN_QUESTIONS,
-      maxQuestionsBeforeGuess: INITIAL_MAX_QUESTIONS
+  id: sessionId,
+  language,
+  turns: [],
+  rejectedGuesses: [],
+  guessStreak: 0,
+  questionsSincePhaseReset: 0,
+  minQuestionsBeforeGuess: INITIAL_MIN_QUESTIONS,
+  maxQuestionsBeforeGuess: INITIAL_MAX_QUESTIONS,
+  followupMode: false
+  
     };
 
     sessions.set(sessionId, session);
@@ -797,6 +799,7 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
+    // ✅ إذا التخمين صحيح
     if (correct) {
       const wiki = await fetchWikipediaSummary(String(guessName || ''), session.language);
 
@@ -804,6 +807,7 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       session.questionsSincePhaseReset = 0;
       session.minQuestionsBeforeGuess = INITIAL_MIN_QUESTIONS;
       session.maxQuestionsBeforeGuess = INITIAL_MAX_QUESTIONS;
+      session.followupMode = false;
 
       return res.json({
         type: 'revealed',
@@ -811,6 +815,35 @@ app.post('/api/game/guess-confirm', async (req, res) => {
         wiki
       });
     }
+
+    // ❌ إذا التخمين خطأ
+    if (guessName) {
+      session.rejectedGuesses.push(String(guessName));
+    }
+
+    session.guessStreak += 1;
+
+    // 🔥 أول 3 مرات: يخمن مباشرة
+    if (session.guessStreak < MAX_CONSECUTIVE_GUESSES) {
+      const result = await forceSingleGuess(session);
+      return res.json(result);
+    }
+
+    // 🔥 بعد 3 تخمينات غلط: يرجع للأسئلة
+    session.guessStreak = 0;
+    session.questionsSincePhaseReset = 0;
+    session.minQuestionsBeforeGuess = FOLLOWUP_MIN_QUESTIONS;
+    session.maxQuestionsBeforeGuess = FOLLOWUP_MAX_QUESTIONS;
+    session.followupMode = true;
+
+    const result = await askEngine(session);
+    return res.json(result);
+
+  } catch (error) {
+    console.error('/api/game/guess-confirm error:', error);
+    return res.status(500).json({ error: 'Failed to confirm guess' });
+  }
+});
 
     if (guessName) {
       session.rejectedGuesses.push(String(guessName));
@@ -834,6 +867,13 @@ session.maxQuestionsBeforeGuess = FOLLOWUP_MAX_QUESTIONS;
 const oldTurns = session.turns.map((t) => ({
   question: t.question,
   answer: t.answer
+}));
+
+session.turns = [];                // 👈 مهم
+session.previousTurns = oldTurns;  // 👈 مهم
+
+const result = await askEngine(session);
+return res.json(result);
 }));
 
 session.turns = [];
