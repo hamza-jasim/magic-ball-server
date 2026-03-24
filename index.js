@@ -373,7 +373,13 @@ function contradictsState(text, session) {
 
 function repeatedConcept(text, session) {
   const key = questionConceptKey(text);
-  return session.turns.some((t) => questionConceptKey(t.question) === key);
+
+  const currentTurns = session.turns || [];
+  const previousTurns = session.previousTurns || [];
+
+  return [...currentTurns, ...previousTurns].some(
+    (t) => questionConceptKey(t.question) === key
+  );
 }
 
 
@@ -769,14 +775,26 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       return res.json(result);
     }
 
-    // after 3 wrong guesses => reset and ask 5 to 8 more questions
-    session.guessStreak = 0;
-    session.questionsSincePhaseReset = 0;
-    session.minQuestionsBeforeGuess = FOLLOWUP_MIN_QUESTIONS;
-    session.maxQuestionsBeforeGuess = FOLLOWUP_MAX_QUESTIONS;
+    // after 3 wrong guesses => reset and ask 5 to 8 NEW questions
+session.guessStreak = 0;
+session.questionsSincePhaseReset = 0;
+session.minQuestionsBeforeGuess = FOLLOWUP_MIN_QUESTIONS;
+session.maxQuestionsBeforeGuess = FOLLOWUP_MAX_QUESTIONS;
 
-    const result = await askEngine(session);
-    return res.json(result);
+// 🔥 امنع إعادة نفس أفكار الأسئلة القديمة
+const oldTurns = session.turns.map((t) => ({
+  question: t.question,
+  answer: t.answer
+}));
+
+session.turns = [];
+
+// نخزن القديم مؤقتًا حتى السيرفر يعرف شنو انسأل سابقًا
+session.previousTurns = oldTurns;
+
+const result = await askEngine(session);
+return res.json(result);
+
   } catch (error) {
     console.error('/api/game/guess-confirm error:', error);
     return res.status(500).json({ error: 'Failed to confirm guess' });
