@@ -382,8 +382,65 @@ function repeatedConcept(text, session) {
   );
 }
 
+function nextFollowupQuestion(session) {
+  const language = session.language;
+  const state = inferState(session.turns);
+
+  const pool = language === 'ar'
+    ? [
+        { text: 'هل هو عربي؟', when: state.arab == null && state.foreign == null },
+        { text: 'هل هو أجنبي؟', when: state.arab == null && state.foreign == null },
+
+        { text: 'هل هو حي؟', when: state.alive == null && state.dead == null },
+        { text: 'هل هو متوفى؟', when: state.alive == null && state.dead == null },
+
+        { text: 'هل هو رياضي؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+        { text: 'هل هو فنان؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+        { text: 'هل هو سياسي؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+        { text: 'هل هو عالم؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+
+        { text: 'هل هو ممثل؟', when: state.artist === true && state.actor == null && state.singer == null },
+        { text: 'هل هو مغني؟', when: state.artist === true && state.actor == null && state.singer == null },
+
+        { text: 'هل هو لاعب كرة؟', when: state.athlete === true && state.footballer == null },
+
+        { text: 'هل هو حي؟', when: true }
+      ]
+    : [
+        { text: 'Is it Arab?', when: state.arab == null && state.foreign == null },
+        { text: 'Is it foreign?', when: state.arab == null && state.foreign == null },
+
+        { text: 'Is it alive?', when: state.alive == null && state.dead == null },
+        { text: 'Is it dead?', when: state.alive == null && state.dead == null },
+
+        { text: 'Is it an athlete?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+        { text: 'Is it an artist?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+        { text: 'Is it a politician?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+        { text: 'Is it a scientist?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+
+        { text: 'Is it an actor?', when: state.artist === true && state.actor == null && state.singer == null },
+        { text: 'Is it a singer?', when: state.artist === true && state.actor == null && state.singer == null },
+
+        { text: 'Is it a footballer?', when: state.athlete === true && state.footballer == null },
+
+        { text: 'Is it alive?', when: true }
+      ];
+
+  for (const item of pool) {
+    if (!item.when) continue;
+    if (repeatedConcept(item.text, session)) continue;
+    if (contradictsState(item.text, session)) continue;
+    return item.text;
+  }
+
+  return language === 'ar' ? 'هل هو حي؟' : 'Is it alive?';
+}
 
 function shortFallbackQuestion(language = 'ar', session = null) {
+  if (session?.followupMode) {
+    return nextFollowupQuestion(session);
+  }
+
   const state = session ? inferState(session.turns) : {};
 
   const pool = language === 'ar'
@@ -409,11 +466,7 @@ function shortFallbackQuestion(language = 'ar', session = null) {
 
         { text: 'هل هو لاعب كرة؟', when: state.athlete === true && state.footballer == null },
 
-        // احتياط أخير
-        { text: 'هل هو عالم؟', when: true },
-        { text: 'هل هو سياسي؟', when: true },
-        { text: 'هل هو حي؟', when: true },
-        { text: 'هل هو عربي؟', when: true }
+        { text: 'هل هو عالم؟', when: true }
       ]
     : [
         { text: 'Is it real?', when: state.real == null && state.fictional == null },
@@ -437,11 +490,7 @@ function shortFallbackQuestion(language = 'ar', session = null) {
 
         { text: 'Is it a footballer?', when: state.athlete === true && state.footballer == null },
 
-        // final fallback
-        { text: 'Is it a scientist?', when: true },
-        { text: 'Is it a politician?', when: true },
-        { text: 'Is it alive?', when: true },
-        { text: 'Is it Arab?', when: true }
+        { text: 'Is it a scientist?', when: true }
       ];
 
   for (const item of pool) {
