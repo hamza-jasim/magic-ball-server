@@ -19,20 +19,12 @@ const openai = process.env.OPENAI_API_KEY
 
 const sessions = new Map();
 
-// ========================
-// FINAL RULES
-// ========================
 const INITIAL_MIN_QUESTIONS = 8;
 const INITIAL_MAX_QUESTIONS = 13;
-
 const FOLLOWUP_MIN_QUESTIONS = 5;
 const FOLLOWUP_MAX_QUESTIONS = 8;
-
 const MAX_CONSECUTIVE_GUESSES = 3;
 
-// ========================
-// HELPERS
-// ========================
 function normalizeAnswer(answer) {
   const map = {
     yes: 'yes',
@@ -85,8 +77,7 @@ BEST QUESTION ORDER:
 7. strong discriminator
 8. move toward best guess
 
-QUALITY EXAMPLES:
-Good:
+GOOD EXAMPLES:
 - "هل هو رجل؟"
 - "هل هي خيالية؟"
 - "هل هو رياضي؟"
@@ -94,13 +85,12 @@ Good:
 - "هل هو حي؟"
 - "هل هو ممثل؟"
 
-Bad:
+BAD EXAMPLES:
 - "هل هو ذكر أو أنثى؟"
 - "هل تعرفه؟"
 - "هل هذه الشخصية مشهورة؟"
 - "Is it male or female?"
 - "Do you know him?"
-- Any question mentioning a candidate name
 
 GUESS RULES:
 - Guess only one person.
@@ -124,9 +114,7 @@ Guess:
 
 function sessionTranscript(session) {
   const turns = session.turns.length
-    ? session.turns
-        .map((t, i) => `Q${i + 1}: ${t.question}\nA${i + 1}: ${t.answer}`)
-        .join('\n')
+    ? session.turns.map((t, i) => `Q${i + 1}: ${t.question}\nA${i + 1}: ${t.answer}`).join('\n')
     : 'No questions yet.';
 
   const rejected = session.rejectedGuesses.length
@@ -138,7 +126,8 @@ function sessionTranscript(session) {
     `Rejected guesses: ${rejected}`,
     `Wrong guess streak: ${session.guessStreak}`,
     `Questions in current phase: ${session.questionsSincePhaseReset}`,
-    `Current phase window: ${session.minQuestionsBeforeGuess} to ${session.maxQuestionsBeforeGuess}`
+    `Current phase window: ${session.minQuestionsBeforeGuess} to ${session.maxQuestionsBeforeGuess}`,
+    `Follow-up mode: ${session.followupMode ? 'true' : 'false'}`
   ].join('\n\n');
 }
 
@@ -218,17 +207,14 @@ function looksLikeNameQuestion(text = '') {
 function questionConceptKey(text = '') {
   const lower = safeLower(text);
 
-  // identity
   if (lower.includes('حقيقي') || lower.includes('خيالي') || lower.includes('real') || lower.includes('fiction')) {
     return 'reality';
   }
 
-  // gender
   if (lower.includes('رجل') || lower.includes('امرأة') || lower.includes('male') || lower.includes('female')) {
     return 'gender';
   }
 
-  // nationality / region
   if (
     lower.includes('عربي') ||
     lower.includes('أجنبي') ||
@@ -242,7 +228,6 @@ function questionConceptKey(text = '') {
     return 'region';
   }
 
-  // alive/dead
   if (
     lower.includes('حي') ||
     lower.includes('متوفى') ||
@@ -253,7 +238,6 @@ function questionConceptKey(text = '') {
     return 'alive';
   }
 
-  // profession broad
   if (
     lower.includes('فنان') ||
     lower.includes('artist') ||
@@ -267,7 +251,6 @@ function questionConceptKey(text = '') {
     return 'field';
   }
 
-  // narrow categories
   if (lower.includes('ممثل') || lower.includes('actor')) return 'actor';
   if (lower.includes('مغني') || lower.includes('singer')) return 'singer';
   if (lower.includes('كرة') || lower.includes('football')) return 'footballer';
@@ -300,7 +283,6 @@ function inferState(turns) {
     const a = normalizeAnswer(turn.answer);
 
     if (a !== 'yes' && a !== 'no') continue;
-
     const yes = a === 'yes';
 
     const setState = (key) => {
@@ -336,7 +318,6 @@ function contradictsState(text, session) {
   const key = questionConceptKey(text);
   const state = inferState(session.turns);
 
-  // hard contradictions
   if (key === 'actor' && state.singer === true) return true;
   if (key === 'singer' && state.actor === true) return true;
 
@@ -373,13 +354,8 @@ function contradictsState(text, session) {
 
 function repeatedConcept(text, session) {
   const key = questionConceptKey(text);
-
   const currentTurns = session.turns || [];
-  const previousTurns = session.previousTurns || [];
-
-  return [...currentTurns, ...previousTurns].some(
-    (t) => questionConceptKey(t.question) === key
-  );
+  return currentTurns.some((t) => questionConceptKey(t.question) === key);
 }
 
 function nextFollowupQuestion(session) {
@@ -516,19 +492,16 @@ function sanitizeEngineResult(result, session) {
 
   if (result.type === 'question') {
     const text = String(result.text || '').trim();
-    
-const lastQuestion = session.turns.length
-  ? session.turns[session.turns.length - 1].question
-  : '';
 
-if (repeatedConcept(text, session)) {
-  return {
-    type: 'question',
-    text: shortFallbackQuestion(session.language, session)
-  };
-}
     if (!text) {
       return { type: 'question', text: shortFallbackQuestion(session.language, session) };
+    }
+
+    if (repeatedConcept(text, session)) {
+      return {
+        type: 'question',
+        text: shortFallbackQuestion(session.language, session)
+      };
     }
 
     if (isQuestionTooLong(text, session.language)) {
@@ -544,10 +517,6 @@ if (repeatedConcept(text, session)) {
     }
 
     if (looksLikeNameQuestion(text)) {
-      return { type: 'question', text: shortFallbackQuestion(session.language, session) };
-    }
-
-    if (repeatedConcept(text, session)) {
       return { type: 'question', text: shortFallbackQuestion(session.language, session) };
     }
 
@@ -626,6 +595,7 @@ async function askEngine(session) {
     if (mustGuessNow(session)) {
       return fallbackGuess(session.language);
     }
+
     return {
       type: 'question',
       text: shortFallbackQuestion(session.language, session)
@@ -652,7 +622,8 @@ SERVER RULES:
 - Never repeat rejected guesses
 - Never mention names in question mode
 - Avoid contradictions
-- Keep questions short and powerful`
+- Keep questions short and powerful
+- If followupMode is true, ask NEW follow-up questions only. Do not reuse earlier concepts.`
       }
     ]
   });
@@ -715,9 +686,6 @@ async function fetchWikipediaSummary(name, language = 'ar') {
   };
 }
 
-// ========================
-// ROUTES
-// ========================
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
@@ -732,16 +700,15 @@ app.post('/api/game/start', async (req, res) => {
     const sessionId = crypto.randomUUID();
 
     const session = {
-  id: sessionId,
-  language,
-  turns: [],
-  rejectedGuesses: [],
-  guessStreak: 0,
-  questionsSincePhaseReset: 0,
-  minQuestionsBeforeGuess: INITIAL_MIN_QUESTIONS,
-  maxQuestionsBeforeGuess: INITIAL_MAX_QUESTIONS,
-  followupMode: false
-  
+      id: sessionId,
+      language,
+      turns: [],
+      rejectedGuesses: [],
+      guessStreak: 0,
+      questionsSincePhaseReset: 0,
+      minQuestionsBeforeGuess: INITIAL_MIN_QUESTIONS,
+      maxQuestionsBeforeGuess: INITIAL_MAX_QUESTIONS,
+      followupMode: false
     };
 
     sessions.set(sessionId, session);
@@ -765,20 +732,19 @@ app.post('/api/game/answer', async (req, res) => {
 
     const cleanQuestion = String(question || '').trim().replace(/\s+/g, ' ');
 
-session.turns.push({
-  question: cleanQuestion,
-  answer: normalizeAnswer(answer)
-});
+    session.turns.push({
+      question: cleanQuestion,
+      answer: normalizeAnswer(answer)
+    });
 
-// 👇 هنا مباشرة تحطه
-if (session.turns.length >= 2) {
-  const last = session.turns[session.turns.length - 1].question;
-  const prev = session.turns[session.turns.length - 2].question;
+    if (session.turns.length >= 2) {
+      const last = session.turns[session.turns.length - 1].question;
+      const prev = session.turns[session.turns.length - 2].question;
 
-  if (last === prev) {
-    session.turns.pop();
-  }
-}
+      if (last === prev) {
+        session.turns.pop();
+      }
+    }
 
     session.questionsSincePhaseReset += 1;
 
@@ -799,7 +765,6 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    // ✅ إذا التخمين صحيح
     if (correct) {
       const wiki = await fetchWikipediaSummary(String(guessName || ''), session.language);
 
@@ -816,20 +781,17 @@ app.post('/api/game/guess-confirm', async (req, res) => {
       });
     }
 
-    // ❌ إذا التخمين خطأ
     if (guessName) {
       session.rejectedGuesses.push(String(guessName));
     }
 
     session.guessStreak += 1;
 
-    // 🔥 أول 3 مرات: يخمن مباشرة
     if (session.guessStreak < MAX_CONSECUTIVE_GUESSES) {
       const result = await forceSingleGuess(session);
       return res.json(result);
     }
 
-    // 🔥 بعد 3 تخمينات غلط: يرجع للأسئلة
     session.guessStreak = 0;
     session.questionsSincePhaseReset = 0;
     session.minQuestionsBeforeGuess = FOLLOWUP_MIN_QUESTIONS;
@@ -838,52 +800,6 @@ app.post('/api/game/guess-confirm', async (req, res) => {
 
     const result = await askEngine(session);
     return res.json(result);
-
-  } catch (error) {
-    console.error('/api/game/guess-confirm error:', error);
-    return res.status(500).json({ error: 'Failed to confirm guess' });
-  }
-});
-
-    if (guessName) {
-      session.rejectedGuesses.push(String(guessName));
-    }
-
-    session.guessStreak += 1;
-
-    // first 3 wrong guesses => allow consecutive guesses
-    if (session.guessStreak < MAX_CONSECUTIVE_GUESSES) {
-      const result = await forceSingleGuess(session);
-      return res.json(result);
-    }
-
-    // after 3 wrong guesses => reset and ask 5 to 8 NEW questions
-session.guessStreak = 0;
-session.questionsSincePhaseReset = 0;
-session.minQuestionsBeforeGuess = FOLLOWUP_MIN_QUESTIONS;
-session.maxQuestionsBeforeGuess = FOLLOWUP_MAX_QUESTIONS;
-
-// 🔥 امنع إعادة نفس أفكار الأسئلة القديمة
-const oldTurns = session.turns.map((t) => ({
-  question: t.question,
-  answer: t.answer
-}));
-
-session.turns = [];                // 👈 مهم
-session.previousTurns = oldTurns;  // 👈 مهم
-
-const result = await askEngine(session);
-return res.json(result);
-}));
-
-session.turns = [];
-
-// نخزن القديم مؤقتًا حتى السيرفر يعرف شنو انسأل سابقًا
-session.previousTurns = oldTurns;
-
-const result = await askEngine(session);
-return res.json(result);
-
   } catch (error) {
     console.error('/api/game/guess-confirm error:', error);
     return res.status(500).json({ error: 'Failed to confirm guess' });
