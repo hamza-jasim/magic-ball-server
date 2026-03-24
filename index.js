@@ -1,697 +1,450 @@
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import OpenAI from 'openai';
 import crypto from 'node:crypto';
-
-dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const port = Number(process.env.PORT || 3001);
-const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const model = process.env.OPENAI_MODEL || 'gpt-4o';
 
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
   : null;
 
+// ========================
+// CONSTANTS
+// ========================
+const INITIAL_MIN = 7;
+const INITIAL_MAX = 12;
+const FOLLOWUP_MIN = 4;
+const FOLLOWUP_MAX = 7;
+const MAX_CONSECUTIVE_GUESSES = 3;
+const SESSION_TTL_MS = 60 * 60 * 1000;
+
+// ========================
+// SESSION STORE
+// ========================
 const sessions = new Map();
 
-const INITIAL_MIN_QUESTIONS = 8;
-const INITIAL_MAX_QUESTIONS = 13;
-const FOLLOWUP_MIN_QUESTIONS = 5;
-const FOLLOWUP_MAX_QUESTIONS = 8;
-const MAX_CONSECUTIVE_GUESSES = 3;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of sessions) {
+    if (s.expiresAt < now) sessions.delete(id);
+  }
+}, 5 * 60 * 1000);
 
+// ========================
+// HELPERS
+// ========================
 function normalizeAnswer(answer) {
   const map = {
     yes: 'yes',
     no: 'no',
     maybe: 'maybe',
-    dontKnow: 'dont_know',
-    dont_know: 'dont_know'
+    dontknow: 'dont_know',
+    dont_know: 'dont_know',
   };
-
-  return map[String(answer || '').trim()] || 'dont_know';
-}
-
-function makeSystemPrompt(language = 'ar') {
-  return `You are the final production-grade character guessing engine for a mobile app.
-
-MISSION:
-Identify the user's character through very short, high-value, contradiction-free questions.
-
-STRICT FORMAT:
-- Return STRICT JSON only.
-- No markdown.
-- No explanations.
-- No commentary.
-- No multiple options in one question.
-
-ALLOWED ANSWERS:
-yes, no, maybe, dont_know
-
-ABSOLUTE QUESTION RULES:
-- Ask only ONE question at a time.
-- Arabic questions should usually be 2 to 5 words.
-- English questions should usually be 2 to 7 words.
-- Keep them sharp, natural, and easy.
-- Never mention any person name during question mode.
-- Never ask name-based questions.
-- Never ask a double-choice question such as "male or female".
-- Never ask generic weak questions like "Is this person famous?" unless there is absolutely no better discriminator.
-- Never repeat a previous question or repeat the same meaning with different wording.
-- Never contradict confirmed information.
-- Never jump to an unrelated domain after a strong confirmation.
-- Every question should eliminate many possibilities.
-
-BEST QUESTION ORDER:
-1. real vs fictional
-2. male vs female
-3. broad field
-4. nationality / region
-5. alive vs dead
-6. narrower category
-7. strong discriminator
-8. move toward best guess
-
-GOOD EXAMPLES:
-- "هل هو رجل؟"
-- "هل هي خيالية؟"
-- "هل هو رياضي؟"
-- "هل هو عربي؟"
-- "هل هو حي؟"
-- "هل هو ممثل؟"
-
-BAD EXAMPLES:
-- "هل هو ذكر أو أنثى؟"
-- "هل تعرفه؟"
-- "هل هذه الشخصية مشهورة؟"
-- "Is it male or female?"
-- "Do you know him?"
-
-GUESS RULES:
-- Guess only one person.
-- Never repeat rejected guesses.
-- Do not guess before enough evidence.
-- When enough evidence exists, guess decisively.
-- After multiple wrong guesses, return to tighter questions before guessing again.
-
-LANGUAGE:
-- If language is "ar", output Arabic only.
-- If language is "en", output English only.
-
-OUTPUT FORMAT:
-
-Question:
-{"type":"question","text":"..."}
-
-Guess:
-{"type":"guess","name":"...","confidence":0.82}`;
-}
-
-function sessionTranscript(session) {
-  const turns = session.turns.length
-    ? session.turns.map((t, i) => `Q${i + 1}: ${t.question}\nA${i + 1}: ${t.answer}`).join('\n')
-    : 'No questions yet.';
-
-  const rejected = session.rejectedGuesses.length
-    ? session.rejectedGuesses.join(', ')
-    : 'none';
-
-  return [
-    `Turns:\n${turns}`,
-    `Rejected guesses: ${rejected}`,
-    `Wrong guess streak: ${session.guessStreak}`,
-    `Questions in current phase: ${session.questionsSincePhaseReset}`,
-    `Current phase window: ${session.minQuestionsBeforeGuess} to ${session.maxQuestionsBeforeGuess}`,
-    `Follow-up mode: ${session.followupMode ? 'true' : 'false'}`
-  ].join('\n\n');
-}
-
-function canGuessNow(session) {
-  return session.questionsSincePhaseReset >= session.minQuestionsBeforeGuess;
-}
-
-function mustGuessNow(session) {
-  return session.questionsSincePhaseReset >= session.maxQuestionsBeforeGuess;
+  return map[String(answer ?? '').trim().toLowerCase().replace(/[^a-z_]/g, '')] ?? 'dont_know';
 }
 
 function safeLower(v) {
-  return String(v || '').trim().toLowerCase();
+  return String(v ?? '').trim().toLowerCase();
 }
 
-function wordCount(text = '') {
+function wordCount(text) {
   return String(text).trim().split(/\s+/).filter(Boolean).length;
-}
-
-function isQuestionTooLong(text = '', language = 'ar') {
-  const count = wordCount(text);
-  return language === 'ar' ? count > 5 : count > 7;
-}
-
-function isWeakQuestion(text = '') {
-  const lower = safeLower(text);
-
-  const weakPatterns = [
-    'هل هو مشهور',
-    'هل هي مشهورة',
-    'هل هذه الشخصية مشهورة',
-    'هل تعرفه',
-    'هل تعرفها',
-    'هل تعرف هذه الشخصية',
-    'is it famous',
-    'is this person famous',
-    'is this character famous',
-    'do you know',
-    'is it well known',
-    'is the person popular'
-  ];
-
-  return weakPatterns.some((x) => lower.includes(x));
-}
-
-function isDoubleChoiceQuestion(text = '') {
-  const lower = safeLower(text);
-  return (
-    lower.includes(' أو ') ||
-    lower.includes('or') ||
-    lower.includes('male or female') ||
-    lower.includes('ذكر أو أنثى')
-  );
-}
-
-function looksLikeNameQuestion(text = '') {
-  const lower = safeLower(text);
-
-  if (
-    lower.startsWith('is it ') ||
-    lower.startsWith('is this ') ||
-    lower.startsWith('could it be ') ||
-    lower.startsWith('is the person ') ||
-    lower.startsWith('is this person ')
-  ) {
-    return true;
-  }
-
-  if (lower.includes('هل هو ') || lower.includes('هل هي ')) {
-    const count = wordCount(lower);
-    if (count > 4) return true;
-  }
-
-  return false;
-}
-
-function questionConceptKey(text = '') {
-  const lower = safeLower(text);
-
-  if (lower.includes('حقيقي') || lower.includes('خيالي') || lower.includes('real') || lower.includes('fiction')) {
-    return 'reality';
-  }
-
-  if (lower.includes('رجل') || lower.includes('امرأة') || lower.includes('male') || lower.includes('female')) {
-    return 'gender';
-  }
-
-  if (
-    lower.includes('عربي') ||
-    lower.includes('أجنبي') ||
-    lower.includes('arab') ||
-    lower.includes('foreign') ||
-    lower.includes('مصري') ||
-    lower.includes('عراقي') ||
-    lower.includes('american') ||
-    lower.includes('british')
-  ) {
-    return 'region';
-  }
-
-  if (
-    lower.includes('حي') ||
-    lower.includes('متوفى') ||
-    lower.includes('alive') ||
-    lower.includes('dead') ||
-    lower.includes('deceased')
-  ) {
-    return 'alive';
-  }
-
-  if (
-    lower.includes('فنان') ||
-    lower.includes('artist') ||
-    lower.includes('رياضي') ||
-    lower.includes('athlete') ||
-    lower.includes('سياسي') ||
-    lower.includes('politician') ||
-    lower.includes('عالم') ||
-    lower.includes('scientist')
-  ) {
-    return 'field';
-  }
-
-  if (lower.includes('ممثل') || lower.includes('actor')) return 'actor';
-  if (lower.includes('مغني') || lower.includes('singer')) return 'singer';
-  if (lower.includes('كرة') || lower.includes('football')) return 'footballer';
-  if (lower.includes('لاعب') && lower.includes('كرة')) return 'footballer';
-
-  return lower.replace(/\s+/g, ' ').trim();
 }
 
 function inferState(turns) {
   const state = {
-    real: null,
-    fictional: null,
-    male: null,
-    female: null,
-    arab: null,
-    foreign: null,
-    alive: null,
-    dead: null,
-    artist: null,
-    athlete: null,
-    politician: null,
-    scientist: null,
-    actor: null,
-    singer: null,
-    footballer: null
+    real: null, fictional: null,
+    male: null, female: null,
+    arab: null, alive: null,
+    athlete: null, actor: null, singer: null,
+    footballer: null, politician: null, scientist: null,
+    director: null, presenter: null, historical: null,
+    animated: null, villain: null, hero: null,
+    royalty: null, businessPerson: null, comedian: null, writer: null,
   };
 
   for (const turn of turns) {
     const q = safeLower(turn.question);
-    const a = normalizeAnswer(turn.answer);
+    const isYes = turn.answer === 'yes';
+    const isNo = turn.answer === 'no';
+    if (!isYes && !isNo) continue;
+    const val = isYes;
 
-    if (a !== 'yes' && a !== 'no') continue;
-    const yes = a === 'yes';
-
-    const setState = (key) => {
-      state[key] = yes;
-    };
-
-    if (q.includes('حقيقي') || q.includes('real')) setState('real');
-    if (q.includes('خيالي') || q.includes('fiction')) setState('fictional');
-
-    if (q.includes('رجل') || q.includes('male')) setState('male');
-    if (q.includes('امرأة') || q.includes('female')) setState('female');
-
-    if (q.includes('عربي') || q.includes('arab')) setState('arab');
-    if (q.includes('أجنبي') || q.includes('foreign')) setState('foreign');
-
-    if (q.includes('حي') || q.includes('alive')) setState('alive');
-    if (q.includes('متوفى') || q.includes('dead') || q.includes('deceased')) setState('dead');
-
-    if (q.includes('فنان') || q.includes('artist')) setState('artist');
-    if (q.includes('رياضي') || q.includes('athlete')) setState('athlete');
-    if (q.includes('سياسي') || q.includes('politician')) setState('politician');
-    if (q.includes('عالم') || q.includes('scientist')) setState('scientist');
-
-    if (q.includes('ممثل') || q.includes('actor')) setState('actor');
-    if (q.includes('مغني') || q.includes('singer')) setState('singer');
-    if (q.includes('كرة') || q.includes('football')) setState('footballer');
+    if (q.includes('حقيقي') || q.includes('real') || q.includes('واقعي')) state.real = val;
+    if (q.includes('خيالي') || q.includes('fiction') || q.includes('كرتون') || q.includes('cartoon')) state.fictional = val;
+    if (q.includes('رجل') || q.includes('ذكر') || q.includes('male') || q.includes(' man') || q.includes('boy')) state.male = val;
+    if (q.includes('امرأة') || q.includes('أنثى') || q.includes('female') || q.includes('woman') || q.includes('girl')) state.female = val;
+    if (q.includes('عربي') || q.includes('arab') || q.includes('خليجي') || q.includes('مصري') || q.includes('سعودي') || q.includes('gulf')) state.arab = val;
+    if (q.includes('حي') || q.includes('alive') || q.includes('living')) state.alive = val;
+    if (q.includes('متوفى') || q.includes('dead') || q.includes('مات') || q.includes('deceased')) state.alive = isNo ? true : false;
+    if (q.includes('رياضي') || q.includes('athlete') || q.includes('sport')) state.athlete = val;
+    if (q.includes('ممثل') || q.includes('actor') || q.includes('actress')) state.actor = val;
+    if (q.includes('مغني') || q.includes('مطرب') || q.includes('singer') || q.includes('موسيق') || q.includes('music')) state.singer = val;
+    if (q.includes('كرة') || q.includes('football') || q.includes('soccer') || q.includes('لاعب كرة')) state.footballer = val;
+    if (q.includes('سياسي') || q.includes('politician') || q.includes('رئيس') || q.includes('president') || q.includes('وزير')) state.politician = val;
+    if (q.includes('عالم') || q.includes('scientist') || q.includes('مخترع') || q.includes('inventor')) state.scientist = val;
+    if (q.includes('مخرج') || q.includes('director') || q.includes('filmmaker')) state.director = val;
+    if (q.includes('مقدم') || q.includes('presenter') || q.includes('host') || q.includes('مذيع')) state.presenter = val;
+    if (q.includes('تاريخي') || q.includes('historical') || q.includes('قديم') || q.includes('ancient')) state.historical = val;
+    if (q.includes('انيميشن') || q.includes('animated') || q.includes('رسوم متحركة')) state.animated = val;
+    if (q.includes('شرير') || q.includes('villain') || q.includes('antagonist')) state.villain = val;
+    if (q.includes('بطل') || q.includes('hero') || q.includes('superhero') || q.includes('خارق')) state.hero = val;
+    if (q.includes('ملكي') || q.includes('royal') || q.includes('ملك') || q.includes('أمير') || q.includes('king') || q.includes('prince')) state.royalty = val;
+    if (q.includes('رجل أعمال') || q.includes('business') || q.includes('ceo') || q.includes('مليارد')) state.businessPerson = val;
+    if (q.includes('كوميدي') || q.includes('comedian') || q.includes('comic')) state.comedian = val;
+    if (q.includes('كاتب') || q.includes('writer') || q.includes('روائي') || q.includes('author')) state.writer = val;
   }
 
   return state;
 }
 
-function contradictsState(text, session) {
-  const key = questionConceptKey(text);
-  const state = inferState(session.turns);
-
-  if (key === 'actor' && state.singer === true) return true;
-  if (key === 'singer' && state.actor === true) return true;
-
-  if (key === 'field') {
-    const lower = safeLower(text);
-    if (state.singer === true && lower.includes('سياسي')) return true;
-    if (state.singer === true && lower.includes('politician')) return true;
-    if (state.actor === true && lower.includes('رياضي')) return true;
-    if (state.actor === true && lower.includes('athlete')) return true;
-    if (state.athlete === true && (lower.includes('مغني') || lower.includes('singer'))) return true;
-    if (state.athlete === true && (lower.includes('ممثل') || lower.includes('actor'))) return true;
-  }
-
-  if (key === 'gender') {
-    const lower = safeLower(text);
-    if (state.male === true && (lower.includes('امرأة') || lower.includes('female'))) return true;
-    if (state.female === true && (lower.includes('رجل') || lower.includes('male'))) return true;
-  }
-
-  if (key === 'alive') {
-    const lower = safeLower(text);
-    if (state.alive === true && (lower.includes('متوفى') || lower.includes('dead'))) return true;
-    if (state.dead === true && (lower.includes('حي') || lower.includes('alive'))) return true;
-  }
-
-  if (key === 'region') {
-    const lower = safeLower(text);
-    if (state.arab === true && (lower.includes('أجنبي') || lower.includes('foreign'))) return true;
-    if (state.foreign === true && (lower.includes('عربي') || lower.includes('arab'))) return true;
-  }
-
-  return false;
+function conceptKey(text) {
+  const q = safeLower(text);
+  if (q.includes('حقيقي') || q.includes('real') || q.includes('خيالي') || q.includes('fiction')) return 'reality';
+  if (q.includes('رجل') || q.includes('امرأة') || q.includes('male') || q.includes('female') || q.includes('ذكر') || q.includes('أنثى')) return 'gender';
+  if (q.includes('عربي') || q.includes('arab') || q.includes('أجنبي') || q.includes('foreign') || q.includes('خليجي')) return 'region';
+  if (q.includes('حي') || q.includes('alive') || q.includes('متوفى') || q.includes('dead')) return 'alive';
+  if (q.includes('رياضي') || q.includes('athlete') || q.includes('sport')) return 'sport';
+  if (q.includes('فنان') || q.includes('artist') || q.includes('مغني') || q.includes('singer') || q.includes('ممثل') || q.includes('actor') || q.includes('موسيق')) return 'arts';
+  if (q.includes('سياسي') || q.includes('politician') || q.includes('رئيس') || q.includes('president')) return 'politics';
+  if (q.includes('كرة') || q.includes('football') || q.includes('soccer')) return 'football';
+  if (q.includes('مخرج') || q.includes('director')) return 'director';
+  if (q.includes('بطل') || q.includes('hero') || q.includes('شرير') || q.includes('villain')) return 'role';
+  if (q.includes('كاتب') || q.includes('writer') || q.includes('author')) return 'writer';
+  return q.replace(/\s+/g, '_').slice(0, 40);
 }
 
 function repeatedConcept(text, session) {
-  const key = questionConceptKey(text);
-  const currentTurns = session.turns || [];
-  return currentTurns.some((t) => questionConceptKey(t.question) === key);
+  const key = conceptKey(text);
+  return session.turns.some((t) => conceptKey(t.question) === key);
 }
 
-function nextFollowupQuestion(session) {
-  const language = session.language;
+function contradictsState(text, state) {
+  const q = safeLower(text);
+  if (state.male === true && (q.includes('امرأة') || q.includes('female') || q.includes('أنثى'))) return true;
+  if (state.female === true && (q.includes('رجل') || q.includes('male') || q.includes('ذكر'))) return true;
+  if (state.alive === true && (q.includes('متوفى') || q.includes('dead'))) return true;
+  if (state.alive === false && (q.includes(' حي') || q.includes('alive') || q.includes('living'))) return true;
+  if (state.real === true && (q.includes('خيالي') || q.includes('fiction') || q.includes('كرتون'))) return true;
+  if (state.fictional === true && (q.includes('حقيقي') || q.includes('real') || q.includes('واقعي'))) return true;
+  if (state.arab === true && (q.includes('أجنبي') || q.includes('foreign') || q.includes('غير عربي'))) return true;
+  if (state.arab === false && (q.includes('عربي') || q.includes('arab') || q.includes('خليجي') || q.includes('مصري'))) return true;
+  return false;
+}
+
+function isWeakQuestion(text) {
+  const q = safeLower(text);
+  const weak = ['مشهور', 'famous', 'do you know', 'تعرفه', 'popular', 'well known', 'كبير', 'هل تعرف', 'معروف'];
+  return weak.some((p) => q.includes(p));
+}
+
+function isDoubleChoice(text) {
+  const q = safeLower(text);
+  return q.includes(' أو ') || q.includes(' or ') || q.includes('ذكر أم') || q.includes('male or female');
+}
+
+function isTooLong(text, lang) {
+  const wc = wordCount(text);
+  return lang === 'ar' ? wc > 6 : wc > 9;
+}
+
+function isNameQuestion(text) {
+  const q = safeLower(text);
+  const namePatterns = ['is it ', 'could it be ', 'is this person ', 'هل هو نفسه', 'هل هي نفسها'];
+  return namePatterns.some((p) => q.startsWith(p) && wordCount(q) <= 4);
+}
+
+function bestFallbackQuestion(lang, session) {
   const state = inferState(session.turns);
+  const asked = new Set(session.turns.map((t) => conceptKey(t.question)));
 
-  const pool = language === 'ar'
-    ? [
-        { text: 'هل هو عربي؟', when: state.arab == null && state.foreign == null },
-        { text: 'هل هو أجنبي؟', when: state.arab == null && state.foreign == null },
+  const candidatesAr = [
+    ['reality', 'هل هي حقيقية؟'],
+    ['gender', 'هل هو رجل؟'],
+    ['region', 'هل هو عربي؟'],
+    ['alive', 'هل هو حي؟'],
+    ['sport', 'هل هو رياضي؟'],
+    ['arts', 'هل هو فنان؟'],
+    ['politics', 'هل هو سياسي؟'],
+    ['football', 'هل هو لاعب كرة قدم؟'],
+    ['director', 'هل هو مخرج؟'],
+    ['writer', 'هل هو كاتب؟'],
+    ['role', 'هل هو بطل؟'],
+  ];
 
-        { text: 'هل هو حي؟', when: state.alive == null && state.dead == null },
-        { text: 'هل هو متوفى؟', when: state.alive == null && state.dead == null },
+  const candidatesEn = [
+    ['reality', 'Is it real?'],
+    ['gender', 'Is it male?'],
+    ['region', 'Is it Arab?'],
+    ['alive', 'Is it alive?'],
+    ['sport', 'Is it an athlete?'],
+    ['arts', 'Is it an artist?'],
+    ['politics', 'Is it a politician?'],
+    ['football', 'Is it a footballer?'],
+    ['director', 'Is it a director?'],
+    ['writer', 'Is it a writer?'],
+    ['role', 'Is it a hero?'],
+  ];
 
-        { text: 'هل هو رياضي؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-        { text: 'هل هو فنان؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-        { text: 'هل هو سياسي؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-        { text: 'هل هو عالم؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+  const candidates = lang === 'ar' ? candidatesAr : candidatesEn;
 
-        { text: 'هل هو ممثل؟', when: state.artist === true && state.actor == null && state.singer == null },
-        { text: 'هل هو مغني؟', when: state.artist === true && state.actor == null && state.singer == null },
-
-        { text: 'هل هو لاعب كرة؟', when: state.athlete === true && state.footballer == null },
-
-        { text: 'هل هو حي؟', when: true }
-      ]
-    : [
-        { text: 'Is it Arab?', when: state.arab == null && state.foreign == null },
-        { text: 'Is it foreign?', when: state.arab == null && state.foreign == null },
-
-        { text: 'Is it alive?', when: state.alive == null && state.dead == null },
-        { text: 'Is it dead?', when: state.alive == null && state.dead == null },
-
-        { text: 'Is it an athlete?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-        { text: 'Is it an artist?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-        { text: 'Is it a politician?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-        { text: 'Is it a scientist?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-
-        { text: 'Is it an actor?', when: state.artist === true && state.actor == null && state.singer == null },
-        { text: 'Is it a singer?', when: state.artist === true && state.actor == null && state.singer == null },
-
-        { text: 'Is it a footballer?', when: state.athlete === true && state.footballer == null },
-
-        { text: 'Is it alive?', when: true }
-      ];
-
-  for (const item of pool) {
-    if (!item.when) continue;
-    if (repeatedConcept(item.text, session)) continue;
-    if (contradictsState(item.text, session)) continue;
-    return item.text;
+  for (const [key, question] of candidates) {
+    if (!asked.has(key) && !contradictsState(question, state)) {
+      return question;
+    }
   }
 
-  return language === 'ar' ? 'هل هو حي؟' : 'Is it alive?';
+  if (state.athlete === true && !asked.has('football')) return lang === 'ar' ? 'هل هو لاعب كرة قدم؟' : 'Is it a footballer?';
+  if (state.actor === true && !asked.has('movie_type')) return lang === 'ar' ? 'هل هو في أفلام أكشن؟' : 'Is it in action movies?';
+  if (state.singer === true && !asked.has('music_type')) return lang === 'ar' ? 'هل موسيقاه عربية؟' : 'Is the music Arabic?';
+
+  return lang === 'ar' ? 'هل هو موجود الآن؟' : 'Is it alive today?';
 }
 
-function shortFallbackQuestion(language = 'ar', session = null) {
-  if (session?.followupMode) {
-    return nextFollowupQuestion(session);
-  }
-
-  const state = session ? inferState(session.turns) : {};
-
-  const pool = language === 'ar'
-    ? [
-        { text: 'هل هي حقيقية؟', when: state.real == null && state.fictional == null },
-        { text: 'هل هي خيالية؟', when: state.real == null && state.fictional == null },
-
-        { text: 'هل هو رجل؟', when: state.male == null && state.female == null },
-        { text: 'هل هي امرأة؟', when: state.male == null && state.female == null },
-
-        { text: 'هل هو رياضي؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-        { text: 'هل هو فنان؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-        { text: 'هل هو سياسي؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-
-        { text: 'هل هو عربي؟', when: state.arab == null && state.foreign == null },
-        { text: 'هل هو أجنبي؟', when: state.arab == null && state.foreign == null },
-
-        { text: 'هل هو حي؟', when: state.alive == null && state.dead == null },
-        { text: 'هل هو متوفى؟', when: state.alive == null && state.dead == null },
-
-        { text: 'هل هو ممثل؟', when: state.artist === true && state.actor == null && state.singer == null },
-        { text: 'هل هو مغني؟', when: state.artist === true && state.actor == null && state.singer == null },
-
-        { text: 'هل هو لاعب كرة؟', when: state.athlete === true && state.footballer == null },
-
-        { text: 'هل هو عالم؟', when: true }
-      ]
-    : [
-        { text: 'Is it real?', when: state.real == null && state.fictional == null },
-        { text: 'Is it fictional?', when: state.real == null && state.fictional == null },
-
-        { text: 'Is it male?', when: state.male == null && state.female == null },
-        { text: 'Is it female?', when: state.male == null && state.female == null },
-
-        { text: 'Is it an athlete?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-        { text: 'Is it an artist?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-        { text: 'Is it a politician?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
-
-        { text: 'Is it Arab?', when: state.arab == null && state.foreign == null },
-        { text: 'Is it foreign?', when: state.arab == null && state.foreign == null },
-
-        { text: 'Is it alive?', when: state.alive == null && state.dead == null },
-        { text: 'Is it dead?', when: state.alive == null && state.dead == null },
-
-        { text: 'Is it an actor?', when: state.artist === true && state.actor == null && state.singer == null },
-        { text: 'Is it a singer?', when: state.artist === true && state.actor == null && state.singer == null },
-
-        { text: 'Is it a footballer?', when: state.athlete === true && state.footballer == null },
-
-        { text: 'Is it a scientist?', when: true }
-      ];
-
-  for (const item of pool) {
-    if (!item.when) continue;
-    if (session && repeatedConcept(item.text, session)) continue;
-    if (session && contradictsState(item.text, session)) continue;
-    return item.text;
-  }
-
-  return language === 'ar' ? 'هل هو حي؟' : 'Is it alive?';
-}
-
-function fallbackGuess(language = 'ar') {
-  return language === 'ar'
+function fallbackGuess(lang) {
+  return lang === 'ar'
     ? { type: 'guess', name: 'شخصية مشهورة', confidence: 0.2 }
     : { type: 'guess', name: 'A famous person', confidence: 0.2 };
 }
 
-function sanitizeEngineResult(result, session) {
-  if (!result || typeof result !== 'object') {
-    return { type: 'question', text: shortFallbackQuestion(session.language, session) };
+function sanitize(raw, session) {
+  if (!raw || typeof raw !== 'object') {
+    return { type: 'question', text: bestFallbackQuestion(session.language, session) };
   }
 
-  if (result.type === 'question') {
-    const text = String(result.text || '').trim();
+  const state = inferState(session.turns);
 
-    if (!text) {
-      return { type: 'question', text: shortFallbackQuestion(session.language, session) };
-    }
-
-    if (repeatedConcept(text, session)) {
-      return {
-        type: 'question',
-        text: shortFallbackQuestion(session.language, session)
-      };
-    }
-
-    if (isQuestionTooLong(text, session.language)) {
-      return { type: 'question', text: shortFallbackQuestion(session.language, session) };
-    }
-
-    if (isWeakQuestion(text)) {
-      return { type: 'question', text: shortFallbackQuestion(session.language, session) };
-    }
-
-    if (isDoubleChoiceQuestion(text)) {
-      return { type: 'question', text: shortFallbackQuestion(session.language, session) };
-    }
-
-    if (looksLikeNameQuestion(text)) {
-      return { type: 'question', text: shortFallbackQuestion(session.language, session) };
-    }
-
-    if (contradictsState(text, session)) {
-      return { type: 'question', text: shortFallbackQuestion(session.language, session) };
-    }
-
+  if (raw.type === 'question') {
+    const text = String(raw.text ?? '').trim();
+    if (!text) return { type: 'question', text: bestFallbackQuestion(session.language, session) };
+    if (isTooLong(text, session.language)) return { type: 'question', text: bestFallbackQuestion(session.language, session) };
+    if (isWeakQuestion(text)) return { type: 'question', text: bestFallbackQuestion(session.language, session) };
+    if (isDoubleChoice(text)) return { type: 'question', text: bestFallbackQuestion(session.language, session) };
+    if (isNameQuestion(text)) return { type: 'question', text: bestFallbackQuestion(session.language, session) };
+    if (repeatedConcept(text, session)) return { type: 'question', text: bestFallbackQuestion(session.language, session) };
+    if (contradictsState(text, state)) return { type: 'question', text: bestFallbackQuestion(session.language, session) };
     return { type: 'question', text };
   }
 
-  if (result.type === 'guess') {
-    const name = String(result.name || '').trim();
-
-    if (!name) {
-      return fallbackGuess(session.language);
-    }
-
+  if (raw.type === 'guess') {
+    const name = String(raw.name ?? '').trim();
+    if (!name) return fallbackGuess(session.language);
     if (session.rejectedGuesses.includes(name)) {
-      return { type: 'question', text: shortFallbackQuestion(session.language, session) };
+      return { type: 'question', text: bestFallbackQuestion(session.language, session) };
     }
-
     return {
       type: 'guess',
       name,
-      confidence: typeof result.confidence === 'number' ? result.confidence : 0.6
+      confidence: typeof raw.confidence === 'number' ? raw.confidence : 0.7,
     };
   }
 
-  return { type: 'question', text: shortFallbackQuestion(session.language, session) };
+  return { type: 'question', text: bestFallbackQuestion(session.language, session) };
 }
 
-async function forceSingleGuess(session) {
+function makeSystemPrompt(lang) {
+  return `You are the world's best character-guessing AI, powering a "20 Questions" style mobile game called Magic Ball.
+
+CORE MISSION: Identify ANY character the user thinks of — real person, fictional character, historical figure, animated character, athlete, politician, celebrity, superhero — as fast and accurately as possible.
+
+LANGUAGE: ${lang === 'ar' ? 'Respond ONLY in Arabic. Questions must be 2-5 Arabic words.' : 'Respond ONLY in English. Questions must be 2-7 English words.'}
+
+STRICT JSON OUTPUT — no markdown, no comments, no explanations:
+- Question: {"type":"question","text":"..."}
+- Guess:    {"type":"guess","name":"...","confidence":0.92}
+
+STRATEGIC QUESTION ORDERING (optimal information gain per question):
+1. FIRST: Real person vs fictional/animated character
+2. SECOND: Male vs female
+3. THIRD: If real → Arab vs non-Arab. If fictional → from which franchise/world
+4. FOURTH: Alive vs deceased (for real people). Hero vs villain (for fictional)
+5. FIFTH: Broad domain — sports / entertainment / politics / science / royalty / business
+6. SIXTH: Narrow domain — footballer / singer / actor / politician / director
+7. SEVENTH: Specific discriminators — nationality, era, most famous achievement
+8. EIGHTH+: Close in on the answer with targeted discriminators
+
+SUPERIOR QUESTION EXAMPLES (Arabic):
+✓ "هل هو حقيقي؟" — real vs fictional
+✓ "هل هو رجل؟" — gender
+✓ "هل هو عربي؟" — region
+✓ "هل هو حي؟" — alive
+✓ "هل هو رياضي؟" — broad domain
+✓ "هل يلعب كرة القدم؟" — narrow sport
+✓ "هل فاز بكأس العالم؟" — achievement discriminator
+✓ "هل هو ممثل هوليوود؟" — narrow entertainment
+✓ "هل هو شرير؟" — fictional role
+
+BAD QUESTIONS (never ask these):
+✗ "هل هو مشهور؟" — useless
+✗ "هل تعرفه؟" — useless
+✗ "هل هو ذكر أو أنثى؟" — double choice
+✗ Any question mentioning a name
+✗ Repeating same concept with different words
+
+GUESSING RULES:
+- Guess only ONE person at a time
+- State name exactly as commonly known (e.g., "محمد صلاح" not "صلاح")
+- Never repeat a rejected guess
+- Be decisive — high confidence means commit to the guess
+- After wrong guesses, ask 4-6 smart questions then guess again
+
+CONFIDENCE GUIDE:
+- 0.95+ = near certain, very strong evidence
+- 0.80-0.94 = strong guess, multiple confirming clues
+- 0.60-0.79 = good guess, most clues point here
+- below 0.60 = uncertain, need more questions
+
+REMEMBER: Every question must eliminate the MAXIMUM number of possibilities. Think binary search over character-space.`;
+}
+
+function sessionContext(session) {
+  const turns = session.turns.length
+    ? session.turns.map((t, i) => `Q${i + 1}: ${t.question}\nA${i + 1}: ${t.answer}`).join('\n')
+    : 'No questions asked yet.';
+
+  const state = inferState(session.turns);
+  const knownFacts = Object.entries(state)
+    .filter(([, v]) => v !== null)
+    .map(([k, v]) => `${k}=${v}`);
+
+  return [
+    `=== CONVERSATION HISTORY ===\n${turns}`,
+    `=== CONFIRMED FACTS ===\n${knownFacts.length ? knownFacts.join(', ') : 'none yet'}`,
+    `=== REJECTED GUESSES ===\n${session.rejectedGuesses.length ? session.rejectedGuesses.join(', ') : 'none'}`,
+    `=== PHASE INFO ===\nQuestions this phase: ${session.questionsSincePhaseReset} | Window: ${session.minQuestionsBeforeGuess}–${session.maxQuestionsBeforeGuess} | Wrong streak: ${session.guessStreak}`,
+  ].join('\n\n');
+}
+
+function canGuess(session) {
+  return session.questionsSincePhaseReset >= session.minQuestionsBeforeGuess;
+}
+
+function mustGuess(session) {
+  return session.questionsSincePhaseReset >= session.maxQuestionsBeforeGuess;
+}
+
+async function runEngine(session) {
   if (!openai) {
-    return fallbackGuess(session.language);
+    if (mustGuess(session)) return fallbackGuess(session.language);
+    return { type: 'question', text: bestFallbackQuestion(session.language, session) };
   }
+
+  const userContent = `Language: ${session.language === 'ar' ? 'Arabic' : 'English'}
+
+${sessionContext(session)}
+
+INSTRUCTIONS FOR THIS TURN:
+- canGuessNow: ${canGuess(session)}
+- mustGuessNow: ${mustGuess(session)}
+- If mustGuessNow is true → output a guess immediately, no more questions
+- If canGuessNow is false → output a question only
+- If canGuessNow is true → output question OR guess depending on confidence
+- NEVER repeat rejected guesses
+- NEVER contradict confirmed facts
+- Pick the single best question if asking`;
 
   const response = await openai.chat.completions.create({
     model,
-    temperature: 0.2,
+    temperature: 0.25,
+    max_tokens: 80,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: makeSystemPrompt(session.language) },
+      { role: 'user', content: userContent },
+    ],
+  });
+
+  const raw = response.choices[0]?.message?.content ?? '{}';
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    if (mustGuess(session)) return await forceGuess(session);
+    return { type: 'question', text: bestFallbackQuestion(session.language, session) };
+  }
+
+  let result = sanitize(parsed, session);
+
+  if (result.type === 'guess' && !canGuess(session)) {
+    result = { type: 'question', text: bestFallbackQuestion(session.language, session) };
+  }
+
+  if (mustGuess(session) && result.type !== 'guess') {
+    return await forceGuess(session);
+  }
+
+  return result;
+}
+
+async function forceGuess(session) {
+  if (!openai) return fallbackGuess(session.language);
+
+  const response = await openai.chat.completions.create({
+    model,
+    temperature: 0.1,
+    max_tokens: 60,
     response_format: { type: 'json_object' },
     messages: [
       {
         role: 'system',
-        content: `Make your single best guess now.
-Do not repeat rejected guesses.
-Return STRICT JSON only.
-
-Format:
-{"type":"guess","name":"...","confidence":0.82}`
+        content: `You must make your single best guess now. Return STRICT JSON only.\nFormat: {"type":"guess","name":"...","confidence":0.82}\nDo NOT repeat: ${session.rejectedGuesses.join(', ') || 'none'}`,
       },
       {
         role: 'user',
-        content: `Language: ${session.language === 'ar' ? 'Arabic' : 'English'}
-
-Game state:
-${sessionTranscript(session)}
-
-Make exactly one best guess now.`
-      }
-    ]
+        content: `Language: ${session.language === 'ar' ? 'Arabic' : 'English'}\n\n${sessionContext(session)}\n\nMake your best guess RIGHT NOW.`,
+      },
+    ],
   });
 
-  const raw = response.choices[0]?.message?.content || '{}';
-
+  const raw = response.choices[0]?.message?.content ?? '{}';
   try {
     const parsed = JSON.parse(raw);
-    const clean = sanitizeEngineResult(parsed, session);
-    return clean.type === 'guess' ? clean : fallbackGuess(session.language);
+    const cleaned = sanitize(parsed, session);
+    return cleaned.type === 'guess' ? cleaned : fallbackGuess(session.language);
   } catch {
     return fallbackGuess(session.language);
   }
 }
 
-async function askEngine(session) {
-  if (!openai) {
-    if (mustGuessNow(session)) {
-      return fallbackGuess(session.language);
-    }
-
-    return {
-      type: 'question',
-      text: shortFallbackQuestion(session.language, session)
-    };
-  }
-
-  const response = await openai.chat.completions.create({
-    model,
-    temperature: 0.3,
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: makeSystemPrompt(session.language) },
-      {
-        role: 'user',
-        content: `Language: ${session.language === 'ar' ? 'Arabic' : 'English'}
-
-Game state:
-${sessionTranscript(session)}
-
-SERVER RULES:
-- Current phase guess window: ${session.minQuestionsBeforeGuess} to ${session.maxQuestionsBeforeGuess}
-- Do not guess before ${session.minQuestionsBeforeGuess} questions in this phase
-- Must guess at ${session.maxQuestionsBeforeGuess} questions in this phase
-- Never repeat rejected guesses
-- Never mention names in question mode
-- Avoid contradictions
-- Keep questions short and powerful
-- If followupMode is true, ask NEW follow-up questions only. Do not reuse earlier concepts.`
-      }
-    ]
-  });
-
-  const raw = response.choices[0]?.message?.content || '{}';
+async function fetchWiki(name, lang) {
+  const l = lang === 'ar' ? 'ar' : 'en';
+  const title = encodeURIComponent(String(name).replace(/ /g, '_'));
+  const url = `https://${l}.wikipedia.org/api/rest_v1/page/summary/${title}`;
 
   try {
-    const parsed = JSON.parse(raw);
-    let result = sanitizeEngineResult(parsed, session);
-
-    if (result.type === 'guess' && !canGuessNow(session)) {
-      result = {
-        type: 'question',
-        text: shortFallbackQuestion(session.language, session)
-      };
-    }
-
-    if (mustGuessNow(session) && result.type !== 'guess') {
-      return await forceSingleGuess(session);
-    }
-
-    return result;
-  } catch {
-    if (mustGuessNow(session)) {
-      return await forceSingleGuess(session);
-    }
-
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const json = await res.json();
     return {
-      type: 'question',
-      text: shortFallbackQuestion(session.language, session)
+      title: json.title ?? name,
+      extract: json.extract ?? '',
+      imageURL: json.thumbnail?.source ?? null,
+      articleURL: json.content_urls?.desktop?.page ?? `https://${l}.wikipedia.org/wiki/${title}`,
     };
-  }
-}
-
-async function fetchWikipediaSummary(name, language = 'ar') {
-  const lang = language === 'ar' ? 'ar' : 'en';
-  const title = encodeURIComponent(String(name || '').replace(/ /g, '_'));
-  const url = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${title}`;
-
-  const res = await fetch(url);
-
-  if (!res.ok) {
+  } catch {
     return {
       title: name,
-      extract: language === 'ar'
-        ? 'لا توجد معلومات متاحة'
-        : 'No information available',
+      extract: lang === 'ar' ? 'لا توجد معلومات متاحة' : 'No information available',
       imageURL: null,
-      articleURL: `https://${lang}.wikipedia.org/wiki/${title}`
+      articleURL: `https://${l}.wikipedia.org/wiki/${title}`,
     };
   }
-
-  const json = await res.json();
-
-  return {
-    title: json.title || name,
-    extract: json.extract || '',
-    imageURL: json.thumbnail?.source || null,
-    articleURL: json.content_urls?.desktop?.page || `https://${lang}.wikipedia.org/wiki/${title}`
-  };
 }
 
+// ========================
+// ROUTES
+// ========================
+
 app.get('/api/health', (_req, res) => {
-  res.json({
-    ok: true,
-    model,
-    hasOpenAI: Boolean(openai)
-  });
+  res.json({ ok: true, model, hasOpenAI: Boolean(openai) });
 });
 
 app.post('/api/game/start', async (req, res) => {
@@ -706,14 +459,13 @@ app.post('/api/game/start', async (req, res) => {
       rejectedGuesses: [],
       guessStreak: 0,
       questionsSincePhaseReset: 0,
-      minQuestionsBeforeGuess: INITIAL_MIN_QUESTIONS,
-      maxQuestionsBeforeGuess: INITIAL_MAX_QUESTIONS,
-      followupMode: false
+      minQuestionsBeforeGuess: INITIAL_MIN,
+      maxQuestionsBeforeGuess: INITIAL_MAX,
+      expiresAt: Date.now() + SESSION_TTL_MS,
     };
 
     sessions.set(sessionId, session);
-
-    const result = await askEngine(session);
+    const result = await runEngine(session);
     return res.json({ sessionId, ...result });
   } catch (error) {
     console.error('/api/game/start error:', error);
@@ -723,32 +475,19 @@ app.post('/api/game/start', async (req, res) => {
 
 app.post('/api/game/answer', async (req, res) => {
   try {
-    const { sessionId, question, answer } = req.body || {};
-    const session = sessions.get(sessionId);
+    const { sessionId, question, answer } = req.body ?? {};
+    const session = sessions.get(String(sessionId ?? ''));
 
-    if (!session) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
+    if (!session) return res.status(404).json({ error: 'Session not found' });
 
-    const cleanQuestion = String(question || '').trim().replace(/\s+/g, ' ');
-
+    session.expiresAt = Date.now() + SESSION_TTL_MS;
     session.turns.push({
-      question: cleanQuestion,
-      answer: normalizeAnswer(answer)
+      question: String(question ?? ''),
+      answer: normalizeAnswer(answer),
     });
-
-    if (session.turns.length >= 2) {
-      const last = session.turns[session.turns.length - 1].question;
-      const prev = session.turns[session.turns.length - 2].question;
-
-      if (last === prev) {
-        session.turns.pop();
-      }
-    }
-
     session.questionsSincePhaseReset += 1;
 
-    const result = await askEngine(session);
+    const result = await runEngine(session);
     return res.json(result);
   } catch (error) {
     console.error('/api/game/answer error:', error);
@@ -758,47 +497,36 @@ app.post('/api/game/answer', async (req, res) => {
 
 app.post('/api/game/guess-confirm', async (req, res) => {
   try {
-    const { sessionId, guessName, correct } = req.body || {};
-    const session = sessions.get(sessionId);
+    const { sessionId, guessName, correct } = req.body ?? {};
+    const session = sessions.get(String(sessionId ?? ''));
 
-    if (!session) {
-      return res.status(404).json({ error: 'Session not found' });
-    }
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    session.expiresAt = Date.now() + SESSION_TTL_MS;
 
     if (correct) {
-      const wiki = await fetchWikipediaSummary(String(guessName || ''), session.language);
-
+      const wiki = await fetchWiki(String(guessName ?? ''), session.language);
       session.guessStreak = 0;
       session.questionsSincePhaseReset = 0;
-      session.minQuestionsBeforeGuess = INITIAL_MIN_QUESTIONS;
-      session.maxQuestionsBeforeGuess = INITIAL_MAX_QUESTIONS;
-      session.followupMode = false;
-
-      return res.json({
-        type: 'revealed',
-        guessName,
-        wiki
-      });
+      session.minQuestionsBeforeGuess = INITIAL_MIN;
+      session.maxQuestionsBeforeGuess = INITIAL_MAX;
+      return res.json({ type: 'revealed', guessName, wiki });
     }
 
-    if (guessName) {
-      session.rejectedGuesses.push(String(guessName));
-    }
-
+    if (guessName) session.rejectedGuesses.push(String(guessName));
     session.guessStreak += 1;
 
     if (session.guessStreak < MAX_CONSECUTIVE_GUESSES) {
-      const result = await forceSingleGuess(session);
+      const result = await forceGuess(session);
       return res.json(result);
     }
 
     session.guessStreak = 0;
     session.questionsSincePhaseReset = 0;
-    session.minQuestionsBeforeGuess = FOLLOWUP_MIN_QUESTIONS;
-    session.maxQuestionsBeforeGuess = FOLLOWUP_MAX_QUESTIONS;
-    session.followupMode = true;
+    session.minQuestionsBeforeGuess = FOLLOWUP_MIN;
+    session.maxQuestionsBeforeGuess = FOLLOWUP_MAX;
 
-    const result = await askEngine(session);
+    const result = await runEngine(session);
     return res.json(result);
   } catch (error) {
     console.error('/api/game/guess-confirm error:', error);
@@ -808,14 +536,10 @@ app.post('/api/game/guess-confirm', async (req, res) => {
 
 app.get('/api/wiki', async (req, res) => {
   try {
-    const name = String(req.query.name || '');
-    const language = req.query.language === 'en' ? 'en' : 'ar';
-
-    if (!name) {
-      return res.status(400).json({ error: 'name is required' });
-    }
-
-    const wiki = await fetchWikipediaSummary(name, language);
+    const name = String(req.query.name ?? '');
+    const lang = req.query.language === 'en' ? 'en' : 'ar';
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    const wiki = await fetchWiki(name, lang);
     return res.json(wiki);
   } catch (error) {
     console.error('/api/wiki error:', error);
@@ -823,6 +547,10 @@ app.get('/api/wiki', async (req, res) => {
   }
 });
 
+// ========================
+// START SERVER
+// ========================
 app.listen(port, () => {
-  console.log(`Magic Ball Beast server running on http://localhost:${port}`);
+  console.log(`✅ Magic Ball server running → http://localhost:${port}`);
+  console.log(`🤖 Model: ${model} | OpenAI: ${Boolean(openai)}`);
 });
