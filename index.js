@@ -450,7 +450,17 @@ function sanitizeEngineResult(result, session) {
 
   if (result.type === 'question') {
     const text = String(result.text || '').trim();
+    
+const lastQuestion = session.turns.length
+  ? session.turns[session.turns.length - 1].question
+  : '';
 
+if (text === lastQuestion) {
+  return {
+    type: 'question',
+    text: shortFallbackQuestion(session.language, session)
+  };
+}
     if (!text) {
       return { type: 'question', text: shortFallbackQuestion(session.language, session) };
     }
