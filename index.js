@@ -455,7 +455,7 @@ const lastQuestion = session.turns.length
   ? session.turns[session.turns.length - 1].question
   : '';
 
-if (text === lastQuestion) {
+if (repeatedConcept(text, session)) {
   return {
     type: 'question',
     text: shortFallbackQuestion(session.language, session)
