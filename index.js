@@ -685,10 +685,22 @@ app.post('/api/game/answer', async (req, res) => {
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    session.turns.push({
-      question: String(question || ''),
-      answer: normalizeAnswer(answer)
-    });
+    const cleanQuestion = String(question || '').trim().replace(/\s+/g, ' ');
+
+session.turns.push({
+  question: cleanQuestion,
+  answer: normalizeAnswer(answer)
+});
+
+// 👇 هنا مباشرة تحطه
+if (session.turns.length >= 2) {
+  const last = session.turns[session.turns.length - 1].question;
+  const prev = session.turns[session.turns.length - 2].question;
+
+  if (last === prev) {
+    session.turns.pop();
+  }
+}
 
     session.questionsSincePhaseReset += 1;
 
