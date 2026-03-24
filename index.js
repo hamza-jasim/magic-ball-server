@@ -375,69 +375,67 @@ function repeatedConcept(text, session) {
   const key = questionConceptKey(text);
   return session.turns.some((t) => questionConceptKey(t.question) === key);
 }
-
 function shortFallbackQuestion(language = 'ar', session = null) {
   const state = session ? inferState(session.turns) : {};
 
-  const ar = [];
-  const en = [];
+  const candidates = language === 'ar'
+    ? [
+        { text: 'هل هي حقيقية؟', when: state.real == null && state.fictional == null },
+        { text: 'هل هي خيالية؟', when: state.real == null && state.fictional == null },
 
-  if (state.real == null && state.fictional == null) {
-    ar.push('هل هي حقيقية؟');
-    en.push('Is it real?');
+        { text: 'هل هو رجل؟', when: state.male == null && state.female == null },
+        { text: 'هل هي امرأة؟', when: state.male == null && state.female == null },
+
+        { text: 'هل هو رياضي؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+        { text: 'هل هو فنان؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+
+        { text: 'هل هو عربي؟', when: state.arab == null && state.foreign == null },
+        { text: 'هل هو أجنبي؟', when: state.arab == null && state.foreign == null },
+
+        { text: 'هل هو حي؟', when: state.alive == null && state.dead == null },
+        { text: 'هل هو متوفى؟', when: state.alive == null && state.dead == null },
+
+        { text: 'هل هو ممثل؟', when: state.artist === true && state.actor == null && state.singer == null },
+        { text: 'هل هو مغني؟', when: state.artist === true && state.actor == null && state.singer == null },
+
+        { text: 'هل هو لاعب كرة؟', when: state.athlete === true && state.footballer == null },
+
+        { text: 'هل هو ممثل؟', when: true }
+      ]
+    : [
+        { text: 'Is it real?', when: state.real == null && state.fictional == null },
+        { text: 'Is it fictional?', when: state.real == null && state.fictional == null },
+
+        { text: 'Is it male?', when: state.male == null && state.female == null },
+        { text: 'Is it female?', when: state.male == null && state.female == null },
+
+        { text: 'Is it an athlete?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+        { text: 'Is it an artist?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+
+        { text: 'Is it Arab?', when: state.arab == null && state.foreign == null },
+        { text: 'Is it foreign?', when: state.arab == null && state.foreign == null },
+
+        { text: 'Is it alive?', when: state.alive == null && state.dead == null },
+        { text: 'Is it dead?', when: state.alive == null && state.dead == null },
+
+        { text: 'Is it an actor?', when: state.artist === true && state.actor == null && state.singer == null },
+        { text: 'Is it a singer?', when: state.artist === true && state.actor == null && state.singer == null },
+
+        { text: 'Is it a footballer?', when: state.athlete === true && state.footballer == null },
+
+        { text: 'Is it an actor?', when: true }
+      ];
+
+  for (const item of candidates) {
+    if (!item.when) continue;
+    if (repeatedConcept(item.text, session)) continue;
+    if (contradictsState(item.text, session)) continue;
+    return item.text;
   }
 
-  if (state.male == null && state.female == null) {
-    ar.push('هل هو رجل؟');
-    en.push('Is it male?');
-  }
-
-  if (state.artist == null && state.athlete == null && state.politician == null && state.scientist == null) {
-    ar.push('هل هو رياضي؟', 'هل هو فنان؟', 'هل هو سياسي؟');
-    en.push('Is it an athlete?', 'Is it an artist?', 'Is it a politician?');
-  }
-
-  if (state.arab == null && state.foreign == null) {
-    ar.push('هل هو عربي؟');
-    en.push('Is it Arab?');
-  }
-
-  if (state.alive == null && state.dead == null) {
-    ar.push('هل هو حي؟');
-    en.push('Is it alive?');
-  }
-
-  if (state.athlete === true && state.footballer == null) {
-    ar.push('هل هو لاعب كرة؟');
-    en.push('Is it a footballer?');
-  }
-
-  if (state.artist === true && state.actor == null && state.singer == null) {
-    ar.push('هل هو ممثل؟', 'هل هو مغني؟');
-    en.push('Is it an actor?', 'Is it a singer?');
-  }
-
-  const defaultsAr = [
-    'هل هي خيالية؟',
-    'هل هو أجنبي؟',
-    'هل هو ممثل؟',
-    'هل هو مغني؟',
-    'هل هو سياسي؟',
-    'هل هو لاعب كرة؟'
-  ];
-
-  const defaultsEn = [
-    'Is it fictional?',
-    'Is it foreign?',
-    'Is it an actor?',
-    'Is it a singer?',
-    'Is it a politician?',
-    'Is it a footballer?'
-  ];
-
-  const list = language === 'ar' ? [...ar, ...defaultsAr] : [...en, ...defaultsEn];
-  return list[0];
+  return language === 'ar' ? 'هل هو ممثل؟' : 'Is it an actor?';
 }
+
 
 function fallbackGuess(language = 'ar') {
   return language === 'ar'
