@@ -375,10 +375,12 @@ function repeatedConcept(text, session) {
   const key = questionConceptKey(text);
   return session.turns.some((t) => questionConceptKey(t.question) === key);
 }
+
+
 function shortFallbackQuestion(language = 'ar', session = null) {
   const state = session ? inferState(session.turns) : {};
 
-  const candidates = language === 'ar'
+  const pool = language === 'ar'
     ? [
         { text: 'هل هي حقيقية؟', when: state.real == null && state.fictional == null },
         { text: 'هل هي خيالية؟', when: state.real == null && state.fictional == null },
@@ -388,6 +390,7 @@ function shortFallbackQuestion(language = 'ar', session = null) {
 
         { text: 'هل هو رياضي؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
         { text: 'هل هو فنان؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+        { text: 'هل هو سياسي؟', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
 
         { text: 'هل هو عربي؟', when: state.arab == null && state.foreign == null },
         { text: 'هل هو أجنبي؟', when: state.arab == null && state.foreign == null },
@@ -400,7 +403,11 @@ function shortFallbackQuestion(language = 'ar', session = null) {
 
         { text: 'هل هو لاعب كرة؟', when: state.athlete === true && state.footballer == null },
 
-        { text: 'هل هو ممثل؟', when: true }
+        // احتياط أخير
+        { text: 'هل هو عالم؟', when: true },
+        { text: 'هل هو سياسي؟', when: true },
+        { text: 'هل هو حي؟', when: true },
+        { text: 'هل هو عربي؟', when: true }
       ]
     : [
         { text: 'Is it real?', when: state.real == null && state.fictional == null },
@@ -411,6 +418,7 @@ function shortFallbackQuestion(language = 'ar', session = null) {
 
         { text: 'Is it an athlete?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
         { text: 'Is it an artist?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
+        { text: 'Is it a politician?', when: state.artist == null && state.athlete == null && state.politician == null && state.scientist == null },
 
         { text: 'Is it Arab?', when: state.arab == null && state.foreign == null },
         { text: 'Is it foreign?', when: state.arab == null && state.foreign == null },
@@ -423,19 +431,22 @@ function shortFallbackQuestion(language = 'ar', session = null) {
 
         { text: 'Is it a footballer?', when: state.athlete === true && state.footballer == null },
 
-        { text: 'Is it an actor?', when: true }
+        // final fallback
+        { text: 'Is it a scientist?', when: true },
+        { text: 'Is it a politician?', when: true },
+        { text: 'Is it alive?', when: true },
+        { text: 'Is it Arab?', when: true }
       ];
 
-  for (const item of candidates) {
+  for (const item of pool) {
     if (!item.when) continue;
-    if (repeatedConcept(item.text, session)) continue;
-    if (contradictsState(item.text, session)) continue;
+    if (session && repeatedConcept(item.text, session)) continue;
+    if (session && contradictsState(item.text, session)) continue;
     return item.text;
   }
 
-  return language === 'ar' ? 'هل هو ممثل؟' : 'Is it an actor?';
+  return language === 'ar' ? 'هل هو حي؟' : 'Is it alive?';
 }
-
 
 function fallbackGuess(language = 'ar') {
   return language === 'ar'
