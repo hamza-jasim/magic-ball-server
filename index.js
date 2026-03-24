@@ -548,9 +548,9 @@ app.get('/api/wiki', async (req, res) => {
 });
 
 // ========================
-// START SERVER
+// START
 // ========================
 app.listen(port, () => {
-  console.log(`✅ Magic Ball server running → http://localhost:${port}`);
-  console.log(`🤖 Model: ${model} | OpenAI: ${Boolean(openai)}`);
+  console.log(`Magic Ball server running on http://localhost:${port}`);
+  console.log(`Model: ${model} | OpenAI: ${Boolean(openai)}`);
 });
