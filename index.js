@@ -591,57 +591,94 @@ function factsSummary(session) {
 // ─────────────────────────────────────────────────────────────────────────────
 async function makeGuess(session) {
   const ar = session.language === 'ar';
-  const fallback = { type:'guess', name: ar ? 'شخصية مشهورة' : 'A famous person', confidence:0.2 };
+  const fallbackName = ar ? 'شخصية مشهورة' : 'A famous person';
+  const fallbackText = ar
+    ? `هل الشخصية التي تفكر بها هي ${fallbackName}؟`
+    : `Is the character you're thinking of ${fallbackName}?`;
+
+  const fallbackWiki = {
+    title: fallbackName,
+    extract: ar ? 'لا توجد معلومات متاحة' : 'No information available',
+    imageURL: null,
+    articleURL: null,
+  };
+
+  const fallback = {
+    type: 'guess',
+    name: fallbackName,
+    guessName: fallbackName,
+    text: fallbackText,
+    confidence: 0.2,
+    wiki: fallbackWiki,
+  };
 
   if (!openai) return fallback;
 
   const summary = factsSummary(session);
   const rejected = session.rejectedGuesses;
-  const qa = session.turns.map((t,i) => `Q${i+1}: ${t.question} → ${t.answer}`).join('\n');
+  const qa = session.turns.map((t, i) => `Q${i + 1}: ${t.question} → ${t.answer}`).join('\n');
 
   const system = ar
     ? `أنت متخصص في تحديد الشخصيات. بناءً على الحقائق المؤكدة، خمّن الشخصية الأكثر احتمالاً.
 قواعد:
-- اسم واحد فقط بالعربية كما هو معروف (مثال: "محمد صلاح"، "فيروز"، "رونالدو")
-- لا تكرر: [${rejected.join(', ')||'لا شيء'}]
-- JSON فقط بدون أي نص آخر: {"type":"guess","name":"...","confidence":0.9}`
+- أعد اسم شخصية واحد فقط.
+- إذا كانت الشخصية أجنبية، يمكنك إرجاع الاسم بالإنجليزية أو العربية.
+- لا تكرر أي اسم مرفوض سابقًا.
+- أعد JSON فقط بهذا الشكل:
+{"type":"guess","name":"...","confidence":0.9}`
     : `You are a character identification expert. Based ONLY on confirmed facts, name the single most likely character.
 Rules:
-- Full name as commonly known (e.g. "Lionel Messi", "Tom Hanks", "Iron Man")
-- NEVER repeat: [${rejected.join(', ')||'none'}]
-- JSON only, no extra text: {"type":"guess","name":"...","confidence":0.9}`;
+- Return exactly one character name.
+- Never repeat rejected guesses.
+- Return JSON only in this format:
+{"type":"guess","name":"...","confidence":0.9}`;
 
   const user = `Confirmed facts: ${summary}
 Full Q&A:
 ${qa || 'none yet'}
-Rejected guesses: ${rejected.join(', ')||'none'}
+Rejected guesses: ${rejected.join(', ') || 'none'}
 Make your single best guess now.`;
 
   try {
     const resp = await openai.chat.completions.create({
-      model, temperature:0.1, max_tokens:80,
-      response_format: { type:'json_object' },
-      messages: [{ role:'system', content:system }, { role:'user', content:user }],
+      model: MODEL,
+      temperature: 0.1,
+      max_tokens: 80,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user }
+      ],
     });
-    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? '{}');
-    const name = String(parsed.name ?? '').trim();
-    if (!name || rejected.includes(name)) return fallback;
 
-    // Fetch Wikipedia photo + bio alongside the guess
-    const wiki = await fetchWiki(name, session.language);
+    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? '{}');
+    const rawName = String(parsed.name ?? '').trim();
+
+    if (!rawName || rejected.includes(rawName)) {
+      return fallback;
+    }
+
+    const wiki = await fetchWiki(rawName, session.language);
+
+    const finalName =
+      wiki?.title && wiki.title !== 'undefined' && wiki.title !== 'null'
+        ? wiki.title
+        : rawName;
 
     const text = ar
-      ? `هل الشخصية التي تفكر بها هي ${name}؟`
-      : `Is the character you're thinking of ${name}?`;
+      ? `هل الشخصية التي تفكر بها هي ${finalName}؟`
+      : `Is the character you're thinking of ${finalName}?`;
 
     return {
       type: 'guess',
-      name,
-      guessName: name,
+      name: finalName,
+      guessName: finalName,
       text,
-      confidence: typeof parsed.confidence === 'number'
-        ? Math.min(1, Math.max(0, parsed.confidence)) : 0.75,
-      wiki,
+      confidence:
+        typeof parsed.confidence === 'number'
+          ? Math.min(1, Math.max(0, parsed.confidence))
+          : 0.75,
+      wiki: wiki ?? fallbackWiki,
     };
   } catch (e) {
     console.error('makeGuess:', e?.message);
