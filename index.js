@@ -19,576 +19,456 @@ const openai = process.env.OPENAI_API_KEY
 
 const sessions = new Map();
 
-const INITIAL_MIN_QUESTIONS = 10;
-const INITIAL_MAX_QUESTIONS = 20;
-const FOLLOWUP_MIN_QUESTIONS = 5;
-const FOLLOWUP_MAX_QUESTIONS = 10;
-const MAX_CONSECUTIVE_GUESSES = 3;
+// ============================
+// CONSTANTS
+// ============================
+const INITIAL_MIN_Q  = 10;
+const INITIAL_MAX_Q  = 20;
+const FOLLOWUP_MIN_Q = 5;
+const FOLLOWUP_MAX_Q = 10;
+const MAX_WRONG_GUESSES = 3;
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
+// Clean expired sessions every 5 minutes
 setInterval(() => {
   const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (now - session.lastActivity > SESSION_TTL_MS) {
-      sessions.delete(id);
-    }
+  for (const [id, s] of sessions) {
+    if (now - s.lastActivity > SESSION_TTL_MS) sessions.delete(id);
   }
 }, 5 * 60 * 1000);
 
+// ============================
+// SESSION FACTORY
+// ============================
+function createSession(language) {
+  return {
+    id: crypto.randomUUID(),
+    language: language === 'en' ? 'en' : 'ar',
+    turns: [],               // { question, answer }
+    rejectedGuesses: [],     // names that were wrong
+    guessStreak: 0,          // consecutive wrong guesses
+    phaseQ: 0,               // questions asked in current phase
+    minQ: INITIAL_MIN_Q,
+    maxQ: INITIAL_MAX_Q,
+    lastActivity: Date.now()
+  };
+}
+
+// ============================
+// NORMALIZE ANSWER
+// ============================
 function normalizeAnswer(answer) {
   const map = {
-    yes: 'yes',
-    no: 'no',
-    maybe: 'maybe',
-    dontKnow: 'dont_know',
-    dont_know: 'dont_know'
+    yes: 'yes', no: 'no', maybe: 'maybe',
+    dontKnow: 'dont_know', dont_know: 'dont_know'
   };
   return map[String(answer || '').trim()] || 'dont_know';
 }
 
-function makeSystemPrompt(language = 'ar') {
-  const lang = language === 'ar' ? 'Arabic' : 'English';
+// ============================
+// SYSTEM PROMPT
+// ============================
+function makeSystemPrompt(language) {
   const isAr = language === 'ar';
+  const lang  = isAr ? 'Arabic' : 'English';
 
-  return `You are an elite character-guessing AI for a mobile game called Magic Ball.
-Your job: identify the user's secret character using the fewest, smartest, highest-value questions.
+  return `You are an elite AI engine for a character-guessing mobile game called "Magic Ball."
+Your goal: identify the user's secret character using smart, focused, information-rich questions.
 
-=== CORE MISSION ===
-Follow ONE logical track per game. Once a domain is confirmed (e.g. athlete, actor, fictional character),
-stay within that domain and narrow down systematically. NEVER drift sideways into unrelated domains mid-game.
+━━━ OUTPUT FORMAT (STRICT) ━━━
+Return ONLY valid JSON. No markdown. No explanation. No extra text.
 
-=== STRICT OUTPUT FORMAT ===
-Return ONLY raw JSON. No markdown, no explanations, no extra text.
+Question → {"type":"question","text":"..."}
+Guess    → {"type":"guess","name":"...","confidence":0.90}
 
-Question: {"type":"question","text":"..."}
-Guess:    {"type":"guess","name":"...","confidence":0.85}
+━━━ TRACK DISCIPLINE (CRITICAL) ━━━
+Once a domain is confirmed (e.g. athlete, actor, fictional character, politician), you MUST stay
+inside that domain for ALL subsequent questions. Never switch domains mid-game.
+Example: if user said YES to "Is it a sportsperson?" → every next question must be about sports.
 
-=== QUESTION RULES ===
-- Ask ONE question at a time. Never combine two questions.
-- ${isAr ? 'Arabic questions: 2-5 words maximum.' : 'English questions: 2-7 words maximum.'}
-- Questions must be crisp, binary, and eliminate the most candidates possible.
-- FORBIDDEN question types:
-  * Name-revealing questions (never mention any person's name)
-  * Double-choice questions ("male or female?", "actor or singer?")
-  * Weak generic questions ("Is this person famous?", "Do you know him?")
-  * Questions that repeat a prior question or restate it differently
-  * Questions that contradict confirmed facts
-  * Questions that abandon an established track mid-game
+━━━ QUESTION RULES ━━━
+1. Ask only ONE question per turn — never combine two.
+2. ${isAr ? 'Arabic: max 5 words per question.' : 'English: max 7 words per question.'}
+3. Each question must eliminate as many candidates as possible (maximum information gain).
+4. NEVER ask about a person's name during question mode.
+5. NEVER ask weak questions ("Is this person famous?", "Do you know them?").
+6. NEVER ask double-choice questions ("male or female?", "actor or singer?").
+7. NEVER repeat a previous question, even with different wording.
+8. NEVER contradict confirmed facts from the conversation history.
 
-=== SMART QUESTIONING STRATEGY ===
-Phase 1 - Universe (ask first):
-  1. Real person or fictional character?
-  2. Male or female? (as separate yes/no: "Is it male?")
+━━━ OPTIMAL QUESTION ORDER ━━━
+Phase 1 – Universe:
+  • Real person vs. fictional character?
+  • Male (if real: man; if fictional: male character)?
 
-Phase 2 - Domain (lock onto ONE domain based on answers):
-  3. Broad domain: athlete? entertainer? politician? scientist? fictional hero?
+Phase 2 – Domain (lock ONE domain and never leave):
+  • Broad field: athlete / entertainer / politician / scientist / fictional hero…
 
-Phase 3 - Narrow within domain (stay on this track!):
-  4. Sub-domain: sport type, entertainment branch, region
-  5. Time era: alive/active now or historical?
-  6. Nationality/region if not yet confirmed
+Phase 3 – Narrow within domain:
+  • Sub-category (sport type, entertainment branch, genre…)
+  • Nationality / region
+  • Era: currently active / alive?
 
-Phase 4 - Converge:
-  7-onwards: increasingly specific discriminators until confident to guess
+Phase 4 – Converge to guess:
+  • Increasingly specific discriminators until confident
 
-TRACK DISCIPLINE: If user said YES to "Is it an athlete?" then the next 5+ questions
-must be about sports. Do NOT suddenly ask "Is it an actor?" - that breaks the track.
+━━━ GUESS RULES ━━━
+• Guess ONE name only.
+• Never repeat a rejected guess.
+• Wait until you have enough evidence (respect the min threshold in game state).
+• After a wrong guess, ask 2–3 tight questions before guessing again.
+• ${isAr ? 'Provide the character name in Arabic script (transliterate if needed).' : 'Provide the character name in English.'}
+• Confidence: 0.5 = unsure, 0.95 = very sure — be honest.
 
-=== GUESS RULES ===
-- Never guess before accumulating enough evidence (respect the min questions threshold).
-- Guess exactly ONE name per turn.
-- Never repeat a rejected guess.
-- After a wrong guess: ask 2-4 tight narrowing questions before guessing again.
-- Confidence must reflect actual certainty (0.5 = uncertain, 0.95 = very sure).
-- ${isAr ? 'When language is Arabic, always provide the character name in Arabic script.' : 'Provide the character name in English.'}
-- If the character is well-known globally and language is Arabic, use the Arabic transliteration of their name.
-
-=== LANGUAGE ===
-Output language: ${lang} ONLY.
-All question text and guess name must be in ${lang}.
-
-=== CRITICAL REMINDERS ===
-- No name ever appears in a question.
-- No repeated question semantics even with different wording.
-- Track consistency is mandatory — one confirmed domain means all follow-up questions stay in that domain.
-- Every question must eliminate many candidates at once (information gain maximization).`;
+━━━ LANGUAGE ━━━
+ALL output (questions and guess names) must be in ${lang} only.`;
 }
 
+// ============================
+// BUILD USER MESSAGE
+// ============================
 function buildUserMessage(session) {
-  const turns = session.turns.length
-    ? session.turns
-        .map((t, i) => `Q${i + 1}: ${t.question}\nA${i + 1}: ${t.answer}`)
-        .join('\n')
-    : 'No questions asked yet.';
+  // Conversation history
+  const history = session.turns.length
+    ? session.turns.map((t, i) => `Q${i + 1}: ${t.question}\nA${i + 1}: ${t.answer}`).join('\n')
+    : 'No questions yet.';
 
-  const rejected =
-    session.rejectedGuesses.length > 0
-      ? session.rejectedGuesses.join(', ')
-      : 'none';
+  // Key confirmed facts
+  const facts = session.turns
+    .filter(t => t.answer === 'yes' || t.answer === 'no')
+    .map(t => `${t.answer === 'yes' ? '✓ YES' : '✗ NO'}: ${t.question}`)
+    .join('\n') || 'None yet.';
 
-  const confirmedFacts = [];
-  for (const turn of session.turns) {
-    if (turn.answer === 'yes') {
-      confirmedFacts.push(`CONFIRMED: ${turn.question}`);
-    } else if (turn.answer === 'no') {
-      confirmedFacts.push(`RULED OUT: ${turn.question}`);
-    }
-  }
+  const rejected = session.rejectedGuesses.length
+    ? session.rejectedGuesses.join(', ')
+    : 'none';
 
-  const facts =
-    confirmedFacts.length > 0 ? confirmedFacts.join('\n') : 'None yet.';
-
-  const canGuess = session.questionsSincePhaseReset >= session.minQuestionsBeforeGuess;
-  const mustGuess = session.questionsSincePhaseReset >= session.maxQuestionsBeforeGuess;
-
-  let instruction = '';
-  if (mustGuess) {
-    instruction =
-      'You MUST make a guess now. You have reached the maximum questions for this phase. Output a guess JSON.';
-  } else if (canGuess && session.guessStreak === 0) {
-    instruction =
-      'You have enough information to guess if confident. Otherwise ask one more targeted question.';
-  } else if (session.guessStreak > 0) {
-    const remainingCooldown = 2 - (session.questionsSincePhaseReset - 1);
-    if (remainingCooldown > 0) {
-      instruction = `Last guess was wrong. Ask ${remainingCooldown} more tight narrowing question(s) before guessing again.`;
-    } else {
-      instruction = 'You may guess again now with higher confidence, or ask one more question if needed.';
-    }
+  // Decide instruction
+  let instruction;
+  if (session.phaseQ >= session.maxQ) {
+    instruction = '⚠ MAX QUESTIONS REACHED. You MUST output a guess now.';
+  } else if (session.guessStreak > 0 && session.phaseQ < 2) {
+    instruction = `Last guess was wrong. Ask ${2 - session.phaseQ} more narrowing question(s) before guessing again.`;
+  } else if (session.phaseQ >= session.minQ) {
+    instruction = 'You have enough evidence. Output a guess if confident, or one more targeted question.';
   } else {
-    const remaining = session.minQuestionsBeforeGuess - session.questionsSincePhaseReset;
-    instruction = `Ask ${remaining} more question(s) before guessing. Stay on the confirmed track.`;
+    const left = session.minQ - session.phaseQ;
+    instruction = `Ask ${left} more question(s) before you may guess. Stay strictly on the confirmed domain track.`;
   }
 
-  return `=== GAME STATE ===
+  return `━━━ GAME STATE ━━━
 
 Conversation history:
-${turns}
+${history}
 
-Confirmed facts:
+Key confirmed facts:
 ${facts}
 
 Rejected guesses: ${rejected}
 Wrong guess streak: ${session.guessStreak}
-Questions in this phase: ${session.questionsSincePhaseReset}
-Phase window: min=${session.minQuestionsBeforeGuess}, max=${session.maxQuestionsBeforeGuess}
+Questions this phase: ${session.phaseQ} (min to guess: ${session.minQ}, max: ${session.maxQ})
 
-=== YOUR INSTRUCTION ===
+━━━ YOUR TASK ━━━
 ${instruction}
 
-Output only one JSON object as described in your system prompt.`;
+Respond with exactly one JSON object.`;
 }
 
-function canGuessNow(session) {
-  return session.questionsSincePhaseReset >= session.minQuestionsBeforeGuess;
-}
-
-function mustGuessNow(session) {
-  return session.questionsSincePhaseReset >= session.maxQuestionsBeforeGuess;
-}
-
+// ============================
+// VALIDATION HELPERS
+// ============================
 function safeLower(v) {
   return String(v || '').trim().toLowerCase();
 }
 
-function wordCount(text = '') {
+function wordCount(text) {
   return String(text).trim().split(/\s+/).filter(Boolean).length;
 }
 
-function isQuestionTooLong(text = '', language = 'ar') {
-  const count = wordCount(text);
-  return language === 'ar' ? count > 6 : count > 8;
+function isWeakQuestion(text) {
+  const low = safeLower(text);
+  return [
+    'هل هو مشهور', 'هل هي مشهورة', 'هل هذه الشخصية مشهورة',
+    'هل تعرفه', 'هل تعرفها', 'هل هو معروف', 'هل هي معروفة',
+    'is it famous', 'is this person famous', 'is this character famous',
+    'do you know', 'is it well known', 'is the person popular', 'is it popular'
+  ].some(p => low.includes(p));
 }
 
-function isWeakQuestion(text = '') {
-  const lower = safeLower(text);
-  const weakPatterns = [
-    'هل هو مشهور',
-    'هل هي مشهورة',
-    'هل هذه الشخصية مشهورة',
-    'هل تعرفه',
-    'هل تعرفها',
-    'هل تعرف هذه الشخصية',
-    'is it famous',
-    'is this person famous',
-    'is this character famous',
-    'do you know',
-    'is it well known',
-    'is the person popular',
-    'is it popular',
-    'هل هو معروف',
-    'هل هي معروفة'
-  ];
-  return weakPatterns.some((x) => lower.includes(x));
-}
-
-function isDoubleChoiceQuestion(text = '') {
-  const lower = safeLower(text);
+function isDoubleChoice(text) {
+  const low = safeLower(text);
   return (
-    lower.includes(' أو ') ||
-    (lower.includes(' or ') && !lower.startsWith('is it or')) ||
-    lower.includes('male or female') ||
-    lower.includes('ذكر أو أنثى') ||
-    lower.includes('رجل أو امرأة')
+    low.includes(' أو ') ||
+    low.includes('ذكر أو') ||
+    low.includes('رجل أو') ||
+    low.includes('male or female') ||
+    (low.includes(' or ') && low.includes('?') && !low.startsWith('is it or'))
   );
 }
 
-function looksLikeNameQuestion(text = '') {
-  const lower = safeLower(text);
-  const namePatterns = [
-    'هل اسمه',
-    'هل اسمها',
-    'هل هو محمد',
-    'هل هي فاطمة',
-    'is his name',
-    'is her name',
-    'is it named',
-    'is the name'
-  ];
-  return namePatterns.some((x) => lower.includes(x));
+function isNameQuestion(text) {
+  const low = safeLower(text);
+  return ['هل اسمه', 'هل اسمها', 'is his name', 'is her name', 'is it named', 'is the name']
+    .some(p => low.includes(p));
 }
 
-function isDuplicateQuestion(text = '', session) {
-  const lower = safeLower(text);
-  return session.turns.some((t) => {
-    const prev = safeLower(t.question);
-    if (prev === lower) return true;
-    const similarity = computeSimpleSimilarity(prev, lower);
-    return similarity > 0.8;
-  });
-}
-
-function computeSimpleSimilarity(a, b) {
-  const wordsA = new Set(a.split(/\s+/));
-  const wordsB = new Set(b.split(/\s+/));
+function jaccardSimilarity(a, b) {
+  const setA = new Set(a.split(/\s+/));
+  const setB = new Set(b.split(/\s+/));
   let shared = 0;
-  for (const w of wordsA) {
-    if (wordsB.has(w)) shared++;
-  }
-  const union = new Set([...wordsA, ...wordsB]).size;
+  for (const w of setA) if (setB.has(w)) shared++;
+  const union = new Set([...setA, ...setB]).size;
   return union === 0 ? 0 : shared / union;
 }
 
-function isRejectedGuess(name, session) {
-  const lower = safeLower(name);
-  return session.rejectedGuesses.some((g) => safeLower(g) === lower);
+function isDuplicate(text, session) {
+  const low = safeLower(text);
+  return session.turns.some(t => {
+    const prev = safeLower(t.question);
+    return prev === low || jaccardSimilarity(prev, low) > 0.75;
+  });
 }
 
-function parseAIResponse(raw) {
-  let text = String(raw || '').trim();
-  text = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+function isRejected(name, session) {
+  const low = safeLower(name);
+  return session.rejectedGuesses.some(g => safeLower(g) === low);
+}
+
+function parseJSON(raw) {
+  let text = String(raw || '').trim()
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
   const match = text.match(/\{[\s\S]*\}/);
   if (!match) return null;
-  try {
-    return JSON.parse(match[0]);
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(match[0]); } catch { return null; }
 }
 
-async function callAI(session, retries = 2) {
-  if (!openai) {
-    throw new Error('OpenAI client not initialized. Set OPENAI_API_KEY.');
-  }
+// ============================
+// CALL AI
+// ============================
+async function callAI(session) {
+  if (!openai) throw new Error('OPENAI_API_KEY is not set.');
 
   const messages = [
     { role: 'system', content: makeSystemPrompt(session.language) },
-    { role: 'user', content: buildUserMessage(session) }
+    { role: 'user',   content: buildUserMessage(session) }
   ];
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await openai.chat.completions.create({
         model,
         messages,
-        temperature: 0.4,
-        max_tokens: 150,
-        response_format: { type: 'json_object' }
+        temperature: 0.3,
+        max_tokens: 120
       });
 
-      const raw = res.choices?.[0]?.message?.content || '';
-      const parsed = parseAIResponse(raw);
-
-      if (!parsed || !parsed.type) continue;
-      if (parsed.type !== 'question' && parsed.type !== 'guess') continue;
-      if (parsed.type === 'question' && !parsed.text) continue;
-      if (parsed.type === 'guess' && !parsed.name) continue;
-
-      return parsed;
+      const raw    = res.choices?.[0]?.message?.content || '';
+      const parsed = parseJSON(raw);
+      if (parsed && (parsed.type === 'question' || parsed.type === 'guess')) return parsed;
     } catch (err) {
-      if (attempt === retries) throw err;
-      await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+      if (attempt === 2) throw err;
+      await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
     }
+  }
+  return null;
+}
+
+// ============================
+// GENERATE NEXT STEP
+// Validates & retries until a clean question/guess is produced
+// ============================
+async function generateNext(session) {
+  const MAX_ATTEMPTS = 5;
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const raw = await callAI(session);
+    if (!raw) continue;
+
+    // ---- GUESS ----
+    if (raw.type === 'guess') {
+      const name = String(raw.name || '').trim();
+      if (!name) continue;
+      if (isRejected(name, session)) continue;
+      return raw;
+    }
+
+    // ---- QUESTION ----
+    if (raw.type === 'question') {
+      const text = String(raw.text || '').trim();
+      if (!text) continue;
+      if (isWeakQuestion(text)) continue;
+      if (isDoubleChoice(text)) continue;
+      if (isNameQuestion(text)) continue;
+      if (isDuplicate(text, session)) continue;
+      // Allow slightly long questions on last attempt
+      const maxWords = session.language === 'ar' ? 6 : 9;
+      if (wordCount(text) > maxWords && attempt < MAX_ATTEMPTS - 1) continue;
+      return raw;
+    }
+  }
+
+  // Fallback: if we must guess, return unknown; else fail gracefully
+  if (session.phaseQ >= session.maxQ) {
+    return {
+      type: 'guess',
+      name: session.language === 'ar' ? 'شخصية غير معروفة' : 'Unknown character',
+      confidence: 0.3
+    };
   }
 
   return null;
 }
 
-function createSession(language) {
-  return {
-    id: crypto.randomUUID(),
-    language: language || 'ar',
-    turns: [],
-    rejectedGuesses: [],
-    guessStreak: 0,
-    questionsSincePhaseReset: 0,
-    minQuestionsBeforeGuess: INITIAL_MIN_QUESTIONS,
-    maxQuestionsBeforeGuess: INITIAL_MAX_QUESTIONS,
-    lastActivity: Date.now(),
-    totalGuesses: 0
-  };
-}
+// ============================
+// ROUTES
+// ============================
 
+// POST /api/start  →  { sessionId }
 app.post('/api/start', (req, res) => {
   const language = req.body?.language === 'en' ? 'en' : 'ar';
-  const session = createSession(language);
+  const session  = createSession(language);
   sessions.set(session.id, session);
   res.json({ sessionId: session.id });
 });
 
+// POST /api/next  →  { result: { type, text? } | { type, name, confidence } }
+// Call this to get the first question (no answer yet).
 app.post('/api/next', async (req, res) => {
   const { sessionId } = req.body || {};
-
-  if (!sessionId) {
-    return res.status(400).json({ error: 'sessionId is required' });
-  }
+  if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
 
   const session = sessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found or expired' });
-  }
+  if (!session) return res.status(404).json({ error: 'Session not found or expired' });
 
   session.lastActivity = Date.now();
 
-  if (!openai) {
-    return res.status(503).json({ error: 'AI not configured. Set OPENAI_API_KEY.' });
+  if (!openai) return res.status(503).json({ error: 'AI not configured. Set OPENAI_API_KEY.' });
+
+  try {
+    const result = await generateNext(session);
+    if (!result) return res.status(500).json({ error: 'Could not generate a valid question. Try again.' });
+
+    // Track question count only for questions
+    if (result.type === 'question') session.phaseQ++;
+
+    res.json({ result });
+  } catch (err) {
+    console.error('callAI error:', err.message);
+    res.status(500).json({ error: 'AI request failed: ' + err.message });
   }
-
-  const MAX_VALIDATION_ATTEMPTS = 4;
-  let result = null;
-
-  for (let attempt = 0; attempt < MAX_VALIDATION_ATTEMPTS; attempt++) {
-    const raw = await callAI(session);
-    if (!raw) continue;
-
-    if (raw.type === 'guess') {
-      if (isRejectedGuess(raw.name, session)) continue;
-      result = raw;
-      break;
-    }
-
-    if (raw.type === 'question') {
-      const text = String(raw.text || '').trim();
-
-      if (!text) continue;
-      if (isWeakQuestion(text)) continue;
-      if (isDoubleChoiceQuestion(text)) continue;
-      if (looksLikeNameQuestion(text)) continue;
-      if (isDuplicateQuestion(text, session)) continue;
-      if (isQuestionTooLong(text, session.language) && attempt < MAX_VALIDATION_ATTEMPTS - 1) continue;
-
-      result = raw;
-      break;
-    }
-  }
-
-  if (!result) {
-    if (mustGuessNow(session) || canGuessNow(session)) {
-      result = {
-        type: 'guess',
-        name: session.language === 'ar' ? 'شخصية غير معروفة' : 'Unknown character',
-        confidence: 0.3
-      };
-    } else {
-      return res.status(500).json({ error: 'Failed to generate a valid question after multiple attempts' });
-    }
-  }
-
-  if (result.type === 'question') {
-    session.questionsSincePhaseReset++;
-  }
-
-  res.json({ result });
 });
 
+// POST /api/answer  →  { result: next question or guess }
+// Send the player's answer to the last question, get the next step.
+// Body: { sessionId, question: "text of the question asked", answer: "yes|no|maybe|dont_know" }
 app.post('/api/answer', async (req, res) => {
-  const { sessionId, answer } = req.body || {};
+  const { sessionId, question, answer } = req.body || {};
 
-  if (!sessionId || !answer) {
-    return res.status(400).json({ error: 'sessionId and answer are required' });
-  }
-
-  const session = sessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found or expired' });
-  }
-
-  session.lastActivity = Date.now();
-  const normalized = normalizeAnswer(answer);
-
-  if (!session.pendingQuestion) {
-    return res.status(400).json({ error: 'No pending question to answer' });
-  }
-
-  session.turns.push({
-    question: session.pendingQuestion,
-    answer: normalized
-  });
-
-  session.pendingQuestion = null;
-  res.json({ ok: true });
-});
-
-app.post('/api/next-with-answer', async (req, res) => {
-  const { sessionId, answer, question } = req.body || {};
-
-  if (!sessionId) {
-    return res.status(400).json({ error: 'sessionId is required' });
-  }
+  if (!sessionId)  return res.status(400).json({ error: 'sessionId is required' });
+  if (!question)   return res.status(400).json({ error: 'question is required' });
+  if (!answer)     return res.status(400).json({ error: 'answer is required' });
 
   const session = sessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found or expired' });
-  }
+  if (!session) return res.status(404).json({ error: 'Session not found or expired' });
 
   session.lastActivity = Date.now();
 
-  if (answer && question) {
-    const normalized = normalizeAnswer(answer);
-    session.turns.push({
-      question: String(question),
-      answer: normalized
-    });
-    session.questionsSincePhaseReset++;
+  // Record the answer
+  session.turns.push({ question: String(question), answer: normalizeAnswer(answer) });
+
+  if (!openai) return res.status(503).json({ error: 'AI not configured. Set OPENAI_API_KEY.' });
+
+  try {
+    const result = await generateNext(session);
+    if (!result) return res.status(500).json({ error: 'Could not generate next step. Try again.' });
+
+    if (result.type === 'question') session.phaseQ++;
+
+    res.json({ result });
+  } catch (err) {
+    console.error('callAI error:', err.message);
+    res.status(500).json({ error: 'AI request failed: ' + err.message });
   }
-
-  if (!openai) {
-    return res.status(503).json({ error: 'AI not configured. Set OPENAI_API_KEY.' });
-  }
-
-  const MAX_VALIDATION_ATTEMPTS = 4;
-  let result = null;
-
-  for (let attempt = 0; attempt < MAX_VALIDATION_ATTEMPTS; attempt++) {
-    const raw = await callAI(session);
-    if (!raw) continue;
-
-    if (raw.type === 'guess') {
-      if (isRejectedGuess(raw.name, session)) continue;
-      result = raw;
-      break;
-    }
-
-    if (raw.type === 'question') {
-      const text = String(raw.text || '').trim();
-
-      if (!text) continue;
-      if (isWeakQuestion(text)) continue;
-      if (isDoubleChoiceQuestion(text)) continue;
-      if (looksLikeNameQuestion(text)) continue;
-      if (isDuplicateQuestion(text, session)) continue;
-      if (isQuestionTooLong(text, session.language) && attempt < MAX_VALIDATION_ATTEMPTS - 1) continue;
-
-      result = raw;
-      break;
-    }
-  }
-
-  if (!result) {
-    if (mustGuessNow(session) || canGuessNow(session)) {
-      result = {
-        type: 'guess',
-        name: session.language === 'ar' ? 'شخصية غير معروفة' : 'Unknown character',
-        confidence: 0.3
-      };
-    } else {
-      return res.status(500).json({ error: 'Failed to generate a valid question' });
-    }
-  }
-
-  res.json({ result });
 });
 
-app.post('/api/guess-result', async (req, res) => {
+// POST /api/guess-result  →  { ok, won, gaveUp?, message? }
+// Tell the server whether the guess was correct.
+// Body: { sessionId, correct: true|false, guessedName: "..." }
+app.post('/api/guess-result', (req, res) => {
   const { sessionId, correct, guessedName } = req.body || {};
 
-  if (!sessionId || correct === undefined) {
+  if (!sessionId || correct === undefined)
     return res.status(400).json({ error: 'sessionId and correct are required' });
-  }
 
   const session = sessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found or expired' });
-  }
+  if (!session) return res.status(404).json({ error: 'Session not found or expired' });
 
   session.lastActivity = Date.now();
-  session.totalGuesses++;
 
+  // ---- CORRECT GUESS ----
   if (correct) {
     sessions.delete(sessionId);
     return res.json({ ok: true, won: true });
   }
 
-  if (guessedName) {
-    const name = String(guessedName).trim();
-    if (name && !session.rejectedGuesses.includes(name)) {
-      session.rejectedGuesses.push(name);
-    }
-  }
+  // ---- WRONG GUESS ----
+  const name = String(guessedName || '').trim();
+  if (name && !session.rejectedGuesses.includes(name)) session.rejectedGuesses.push(name);
 
   session.guessStreak++;
 
-  if (session.guessStreak >= MAX_CONSECUTIVE_GUESSES) {
+  if (session.guessStreak >= MAX_WRONG_GUESSES) {
     sessions.delete(sessionId);
     return res.json({
-      ok: true,
-      won: false,
-      gaveUp: true,
-      message:
-        session.language === 'ar'
-          ? 'لم أستطع معرفة الشخصية. أنت الفائز!'
-          : "I couldn't figure it out. You win!"
+      ok: true, won: false, gaveUp: true,
+      message: session.language === 'ar'
+        ? 'لم أستطع معرفة الشخصية. أنت الفائز!'
+        : "I couldn't figure it out. You win!"
     });
   }
 
-  session.minQuestionsBeforeGuess = FOLLOWUP_MIN_QUESTIONS;
-  session.maxQuestionsBeforeGuess = FOLLOWUP_MAX_QUESTIONS;
-  session.questionsSincePhaseReset = 0;
+  // Reset phase counters for follow-up questions
+  session.minQ  = FOLLOWUP_MIN_Q;
+  session.maxQ  = FOLLOWUP_MAX_Q;
+  session.phaseQ = 0;
 
   return res.json({ ok: true, won: false, gaveUp: false });
 });
 
+// GET /api/session/:sessionId  →  session summary (for debugging)
 app.get('/api/session/:sessionId', (req, res) => {
   const session = sessions.get(req.params.sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
+  if (!session) return res.status(404).json({ error: 'Session not found' });
   res.json({
-    sessionId: session.id,
-    language: session.language,
-    turnsCount: session.turns.length,
+    sessionId:      session.id,
+    language:       session.language,
+    turns:          session.turns.length,
     rejectedGuesses: session.rejectedGuesses,
-    guessStreak: session.guessStreak,
-    questionsSincePhaseReset: session.questionsSincePhaseReset,
-    phase: {
-      min: session.minQuestionsBeforeGuess,
-      max: session.maxQuestionsBeforeGuess
-    }
+    guessStreak:    session.guessStreak,
+    phaseQ:         session.phaseQ,
+    phase:          { min: session.minQ, max: session.maxQ }
   });
 });
 
+// DELETE /api/session/:sessionId  →  end session manually
 app.delete('/api/session/:sessionId', (req, res) => {
   sessions.delete(req.params.sessionId);
   res.json({ ok: true });
 });
 
+// GET /health
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', sessions: sessions.size });
+  res.json({ status: 'ok', activeSessions: sessions.size, model });
 });
 
+// ============================
+// START SERVER
+// ============================
 app.listen(port, () => {
   console.log(`Magic Ball server running on port ${port}`);
-  if (!openai) {
-    console.warn('WARNING: OPENAI_API_KEY not set. AI features disabled.');
-  }
+  console.log(`Model: ${model}`);
+  if (!openai) console.warn('WARNING: OPENAI_API_KEY not set. AI features disabled.');
 });
