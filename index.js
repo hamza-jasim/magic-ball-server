@@ -802,7 +802,12 @@ app.post('/api/game/guess-confirm', async (req, res) => {
 
     if (correct) {
       const wiki = await fetchWiki(String(guessName ?? ''), session.language);
-      return res.json({ type:'revealed', guessName, wiki });
+      return res.json({
+        type: 'revealed',
+        name: guessName,
+        guessName,
+        wiki,
+      });
     }
 
     // Wrong guess
