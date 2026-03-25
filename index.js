@@ -13,8 +13,15 @@ app.use(express.json());
 const port = Number(process.env.PORT || 3001);
 const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
-const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+// Support both direct API key and Replit AI Integration proxy
+const openaiApiKey  = process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
+const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL;
+
+const openai = openaiApiKey
+  ? new OpenAI({
+      apiKey:  openaiApiKey,
+      ...(openaiBaseUrl ? { baseURL: openaiBaseUrl } : {})
+    })
   : null;
 
 const sessions = new Map();
@@ -50,6 +57,7 @@ function createSession(language) {
     phaseQ: 0,               // questions asked in current phase
     minQ: INITIAL_MIN_Q,
     maxQ: INITIAL_MAX_Q,
+    lastQuestion: null,      // last question sent to client
     lastActivity: Date.now()
   };
 }
@@ -351,8 +359,11 @@ app.post('/api/next', async (req, res) => {
     const result = await generateNext(session);
     if (!result) return res.status(500).json({ error: 'Could not generate a valid question. Try again.' });
 
-    // Track question count only for questions
-    if (result.type === 'question') session.phaseQ++;
+    // Track question count and store last question
+    if (result.type === 'question') {
+      session.phaseQ++;
+      session.lastQuestion = result.text;
+    }
 
     res.json({ result });
   } catch (err) {
@@ -363,21 +374,25 @@ app.post('/api/next', async (req, res) => {
 
 // POST /api/answer  →  { result: next question or guess }
 // Send the player's answer to the last question, get the next step.
-// Body: { sessionId, question: "text of the question asked", answer: "yes|no|maybe|dont_know" }
+// Body: { sessionId, answer: "yes|no|maybe|dont_know", question?: "..." }
+// Note: question is optional — if not provided, the last question from /api/next is used.
 app.post('/api/answer', async (req, res) => {
   const { sessionId, question, answer } = req.body || {};
 
-  if (!sessionId)  return res.status(400).json({ error: 'sessionId is required' });
-  if (!question)   return res.status(400).json({ error: 'question is required' });
-  if (!answer)     return res.status(400).json({ error: 'answer is required' });
+  if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+  if (!answer)    return res.status(400).json({ error: 'answer is required' });
 
   const session = sessions.get(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found or expired' });
 
   session.lastActivity = Date.now();
 
+  // Use provided question, or fall back to last question stored in session
+  const questionText = question ? String(question) : session.lastQuestion;
+  if (!questionText) return res.status(400).json({ error: 'No question to answer. Call /api/next first.' });
+
   // Record the answer
-  session.turns.push({ question: String(question), answer: normalizeAnswer(answer) });
+  session.turns.push({ question: questionText, answer: normalizeAnswer(answer) });
 
   if (!openai) return res.status(503).json({ error: 'AI not configured. Set OPENAI_API_KEY.' });
 
@@ -385,7 +400,10 @@ app.post('/api/answer', async (req, res) => {
     const result = await generateNext(session);
     if (!result) return res.status(500).json({ error: 'Could not generate next step. Try again.' });
 
-    if (result.type === 'question') session.phaseQ++;
+    if (result.type === 'question') {
+      session.phaseQ++;
+      session.lastQuestion = result.text;
+    }
 
     res.json({ result });
   } catch (err) {
