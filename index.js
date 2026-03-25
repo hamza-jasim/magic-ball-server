@@ -18,10 +18,17 @@ app.use(cors());
 app.use(express.json());
 
 const PORT  = Number(process.env.PORT  || 3001);
-const MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
+const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
-const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+// Support direct key or Replit AI Integration proxy
+const openaiApiKey  = process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
+const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL;
+
+const openai = openaiApiKey
+  ? new OpenAI({
+      apiKey: openaiApiKey,
+      ...(openaiBaseUrl ? { baseURL: openaiBaseUrl } : {})
+    })
   : null;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -31,20 +38,14 @@ const INITIAL_MIN  = 9;
 const INITIAL_MAX  = 15;
 const FOLLOWUP_MIN = 5;
 const FOLLOWUP_MAX = 8;
-const MAX_GUESSES  = 3;          // wrong guesses before going back to questions
+const MAX_GUESSES  = 3;
 const SESSION_TTL  = 60 * 60 * 1000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  QUESTION BANK
-//  Format per entry: { key, ar, en }
-//  • key  = unique concept id — used to prevent repeats and drive state updates
-//  • ar   = Arabic question text
-//  • en   = English question text
-//  Questions are tried in order; already-asked keys and contradictions are skipped.
 // ─────────────────────────────────────────────────────────────────────────────
 const Q = {
 
-  // ── STEP 1: Broad category (asked before domain is known) ─────────────────
   broad: [
     { key:'real',        ar:'هل هو شخص حقيقي؟',              en:'Is it a real person?' },
     { key:'male',        ar:'هل هو رجل؟',                    en:'Is it male?' },
@@ -60,7 +61,6 @@ const Q = {
     { key:'fictional',   ar:'هل هو شخصية خيالية أو كرتونية؟',en:'Is it a fictional or animated character?' },
   ],
 
-  // ── STEP 2a: Athlete — find the sport ─────────────────────────────────────
   athlete_sport: [
     { key:'sport_football',   ar:'هل يلعب كرة القدم؟',       en:'Does it play football/soccer?' },
     { key:'sport_basketball', ar:'هل يلعب كرة السلة؟',       en:'Does it play basketball?' },
@@ -71,7 +71,6 @@ const Q = {
     { key:'sport_other',      ar:'هل هو رياضي أولمبي؟',      en:'Is it an Olympic athlete?' },
   ],
 
-  // ── STEP 2b: Entertainer — find the sub-type ──────────────────────────────
   entertainer_type: [
     { key:'ent_actor',    ar:'هل هو ممثل؟',                  en:'Is it an actor or actress?' },
     { key:'ent_singer',   ar:'هل هو مغني؟',                  en:'Is it a singer?' },
@@ -80,7 +79,6 @@ const Q = {
     { key:'ent_presenter',ar:'هل هو مقدم أو مذيع؟',         en:'Is it a TV presenter or host?' },
   ],
 
-  // ── STEP 3: Footballer ────────────────────────────────────────────────────
   footballer: [
     { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
     { key:'nat_s_american',ar:'هل هو من أمريكا الجنوبية؟',   en:'Is it South American?' },
@@ -112,7 +110,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Basketballer ─────────────────────────────────────────────────
   basketballer: [
     { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
     { key:'era_active',    ar:'هل لا يزال يلعب الآن؟',       en:'Is it still playing now?' },
@@ -122,7 +119,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Tennis player ────────────────────────────────────────────────
   tennis: [
     { key:'nat_european',  ar:'هل هو أوروبي؟',               en:'Is it European?' },
     { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
@@ -135,7 +131,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Boxer ────────────────────────────────────────────────────────
   boxer: [
     { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
     { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
@@ -147,7 +142,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Swimmer ──────────────────────────────────────────────────────
   swimmer: [
     { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
     { key:'nat_european',  ar:'هل هو أوروبي؟',               en:'Is it European?' },
@@ -156,7 +150,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Actor ────────────────────────────────────────────────────────
   actor: [
     { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
     { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
@@ -178,7 +171,6 @@ const Q = {
     { key:'work_drama',    ar:'هل يمثل في أفلام دراما؟',     en:'Is it known for drama films?' },
   ],
 
-  // ── STEP 3: Singer ───────────────────────────────────────────────────────
   singer: [
     { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
     { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
@@ -199,7 +191,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Director ─────────────────────────────────────────────────────
   director: [
     { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
     { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
@@ -211,7 +202,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Comedian ─────────────────────────────────────────────────────
   comedian: [
     { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
     { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
@@ -222,7 +212,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Politician ───────────────────────────────────────────────────
   politician: [
     { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
     { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
@@ -239,7 +228,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Scientist ────────────────────────────────────────────────────
   scientist: [
     { key:'historical',    ar:'هل هو شخصية تاريخية؟',        en:'Is it a historical figure?' },
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
@@ -254,7 +242,6 @@ const Q = {
     { key:'field_math',    ar:'هل هو في مجال الرياضيات؟',    en:'Is it known for mathematics?' },
   ],
 
-  // ── STEP 3: Business ─────────────────────────────────────────────────────
   business: [
     { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
     { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
@@ -265,7 +252,6 @@ const Q = {
     { key:'historical',    ar:'هل هو شخصية تاريخية؟',        en:'Is it a historical figure?' },
   ],
 
-  // ── STEP 3: Royalty ──────────────────────────────────────────────────────
   royalty: [
     { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
     { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
@@ -275,7 +261,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Writer ───────────────────────────────────────────────────────
   writer: [
     { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
     { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
@@ -288,7 +273,6 @@ const Q = {
     { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
   ],
 
-  // ── STEP 3: Fictional / Animated character ───────────────────────────────
   fictional: [
     { key:'fic_superhero', ar:'هل هو بطل خارق؟',             en:'Is it a superhero?' },
     { key:'fic_villain',   ar:'هل هو شرير رئيسي؟',           en:'Is it a main villain?' },
@@ -307,7 +291,6 @@ const Q = {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DOMAIN → QUESTION LIST MAPPING
-//  Once domain is locked, ONLY these lists are consulted (in order)
 // ─────────────────────────────────────────────────────────────────────────────
 const DOMAIN_LISTS = {
   footballer:   ['footballer'],
@@ -315,12 +298,12 @@ const DOMAIN_LISTS = {
   tennis:       ['tennis'],
   boxer:        ['boxer'],
   swimmer:      ['swimmer'],
-  athlete:      ['athlete_sport'],           // broad athlete before sport known
+  athlete:      ['athlete_sport'],
   actor:        ['actor'],
   singer:       ['singer'],
   director:     ['director'],
   comedian:     ['comedian'],
-  entertainer:  ['entertainer_type'],        // broad entertainer before type known
+  entertainer:  ['entertainer_type'],
   politician:   ['politician'],
   scientist:    ['scientist'],
   business:     ['business'],
@@ -341,14 +324,12 @@ setInterval(() => {
 function newSession(language) {
   return {
     language,
-    turns: [],                // { key, question, answer }
-    askedKeys: new Set(),     // fast O(1) dedup — keys of all questions ever asked
-    pendingKey: null,         // key of the question that was just sent, waiting for answer
-    // Confirmed domain info (updated as answers come in)
-    domain: null,             // broad: 'athlete' | 'entertainer' | 'politician' | ...
-    subDomain: null,          // narrow: 'footballer' | 'actor' | 'singer' | ...
-    // Confirmed facts (updated as answers come in)
-    facts: {},                // key → true/false
+    turns: [],
+    askedKeys: new Set(),
+    pendingKey: null,
+    domain: null,
+    subDomain: null,
+    facts: {},
     rejectedGuesses: [],
     guessStreak: 0,
     questionsThisPhase: 0,
@@ -360,7 +341,6 @@ function newSession(language) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STATE UPDATE
-//  Called after each answer to lock domain/subDomain and store facts
 // ─────────────────────────────────────────────────────────────────────────────
 function applyAnswer(session, key, answer) {
   const yes = answer === 'yes';
@@ -369,7 +349,6 @@ function applyAnswer(session, key, answer) {
   if (yes) session.facts[key] = true;
   if (no)  session.facts[key] = false;
 
-  // Broad domain locking (only set if not already set)
   if (!session.domain) {
     if (key === 'athlete'     && yes) session.domain = 'athlete';
     if (key === 'entertainer' && yes) session.domain = 'entertainer';
@@ -379,10 +358,8 @@ function applyAnswer(session, key, answer) {
     if (key === 'royalty'     && yes) session.domain = 'royalty';
     if (key === 'writer'      && yes) session.domain = 'writer';
     if (key === 'fictional'   && yes) session.domain = 'fictional';
-    // If answer is 'no' for multiple domains, it stays null until a yes
   }
 
-  // Sub-domain locking (sport)
   if (!session.subDomain) {
     if (key === 'sport_football'   && yes) { session.subDomain = 'footballer';   session.domain = 'athlete'; }
     if (key === 'sport_basketball' && yes) { session.subDomain = 'basketballer'; session.domain = 'athlete'; }
@@ -390,24 +367,21 @@ function applyAnswer(session, key, answer) {
     if (key === 'sport_boxing'     && yes) { session.subDomain = 'boxer';        session.domain = 'athlete'; }
     if (key === 'sport_swimming'   && yes) { session.subDomain = 'swimmer';      session.domain = 'athlete'; }
     if (key === 'sport_golf'       && yes) { session.subDomain = 'golfer';       session.domain = 'athlete'; }
-    // Sub-domain locking (entertainer)
-    if (key === 'ent_actor'    && yes) { session.subDomain = 'actor';     session.domain = 'entertainer'; }
-    if (key === 'ent_singer'   && yes) { session.subDomain = 'singer';    session.domain = 'entertainer'; }
-    if (key === 'ent_director' && yes) { session.subDomain = 'director';  session.domain = 'entertainer'; }
-    if (key === 'ent_comedian' && yes) { session.subDomain = 'comedian';  session.domain = 'entertainer'; }
-    if (key === 'ent_presenter'&& yes) { session.subDomain = 'comedian';  session.domain = 'entertainer'; } // reuse comedian list
+    if (key === 'ent_actor'        && yes) { session.subDomain = 'actor';        session.domain = 'entertainer'; }
+    if (key === 'ent_singer'       && yes) { session.subDomain = 'singer';       session.domain = 'entertainer'; }
+    if (key === 'ent_director'     && yes) { session.subDomain = 'director';     session.domain = 'entertainer'; }
+    if (key === 'ent_comedian'     && yes) { session.subDomain = 'comedian';     session.domain = 'entertainer'; }
+    if (key === 'ent_presenter'    && yes) { session.subDomain = 'comedian';     session.domain = 'entertainer'; }
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  NEXT QUESTION SELECTOR
-//  Returns the next unasked question from the correct list, or null if exhausted
 // ─────────────────────────────────────────────────────────────────────────────
 function nextQuestion(session) {
-  const { domain, subDomain, askedKeys, facts, language: lang } = session;
+  const { domain, subDomain, askedKeys, language: lang } = session;
   const ar = lang === 'ar';
 
-  // Decide which lists to search (in order)
   let listNames;
   if (subDomain && DOMAIN_LISTS[subDomain]) {
     listNames = DOMAIN_LISTS[subDomain];
@@ -420,20 +394,18 @@ function nextQuestion(session) {
   for (const listName of listNames) {
     const list = Q[listName] ?? [];
     for (const entry of list) {
-      if (askedKeys.has(entry.key)) continue;              // already asked
-      if (!shouldAsk(entry.key, session))  continue;       // contradicted by facts
+      if (askedKeys.has(entry.key)) continue;
+      if (!shouldAsk(entry.key, session)) continue;
       return { key: entry.key, text: ar ? entry.ar : entry.en };
     }
   }
 
-  return null; // all lists exhausted
+  return null;
 }
 
-// Returns false if this question is pointless given what we know
 function shouldAsk(key, session) {
   const f = session.facts;
 
-  // Nationality contradictions
   const nationKeys = ['nat_arab','nat_american','nat_british','nat_french','nat_spanish',
     'nat_portuguese','nat_argentine','nat_brazilian','nat_german','nat_italian','nat_dutch',
     'nat_russian','nat_australian','nat_swiss','nat_serbian','nat_latin','nat_egyptian',
@@ -441,52 +413,40 @@ function shouldAsk(key, session) {
   const knownNat = nationKeys.find(k => f[k] === true);
   if (knownNat && nationKeys.includes(key) && key !== knownNat) return false;
 
-  // Arab = true → skip non-Arab nationalities
   if (f['nat_arab'] === true && ['nat_american','nat_british','nat_french','nat_spanish',
     'nat_portuguese','nat_argentine','nat_brazilian','nat_german','nat_italian',
     'nat_dutch','nat_russian','nat_australian','nat_swiss','nat_serbian','nat_latin'].includes(key)) return false;
-
-  // Arab = false → skip Arab sub-nationalities
   if (f['nat_arab'] === false && ['nat_egyptian','nat_saudi','nat_kuwaiti','nat_emirati'].includes(key)) return false;
-
-  // S.American = true → skip European nationals
   if (f['nat_s_american'] === true && ['nat_french','nat_spanish','nat_british','nat_german',
     'nat_italian','nat_dutch','nat_russian'].includes(key)) return false;
-
-  // European = true → skip American/Arab/Latin
   if (f['nat_european'] === true && ['nat_american','nat_arab','nat_latin'].includes(key)) return false;
 
-  // Sub-domain: if footballer, skip other sport questions
   const sportKeys = ['sport_football','sport_basketball','sport_tennis','sport_boxing','sport_swimming','sport_golf','sport_other'];
   const knownSport = sportKeys.find(k => f[k] === true);
   if (knownSport && sportKeys.includes(key) && key !== knownSport) return false;
 
-  // Sub-domain: if actor, skip other entertainer types
   const entKeys = ['ent_actor','ent_singer','ent_director','ent_comedian','ent_presenter'];
   const knownEnt = entKeys.find(k => f[k] === true);
   if (knownEnt && entKeys.includes(key) && key !== knownEnt) return false;
 
-  // Alive/dead contradictions
   if (f['alive'] === true  && key === 'historical') return false;
   if (f['alive'] === false && key === 'era_active')  return false;
   if (f['historical'] === true && key === 'era_active') return false;
 
-  // Era contradictions
   if (f['era_active'] === true && ['era_90s','era_80s'].includes(key)) return false;
   if (f['era_90s']    === true && key === 'era_80s') return false;
   if (f['era_80s']    === true && key === 'era_90s') return false;
 
-  // Fictional contradictions
-  if (f['real'] === true  && ['fictional','fic_marvel','fic_dc','fic_disney','fic_anime','fic_superhero','fic_villain','fic_fly','fic_powers','fic_game','fic_movie','fic_human'].includes(key)) return false;
-  if (f['fictional'] === true && ['real','athlete','entertainer','politician','scientist','business','royalty','writer'].includes(key)) return false;
+  if (f['real'] === true && ['fictional','fic_marvel','fic_dc','fic_disney','fic_anime',
+    'fic_superhero','fic_villain','fic_fly','fic_powers','fic_game','fic_movie','fic_human'].includes(key)) return false;
+  if (f['fictional'] === true && ['real','athlete','entertainer','politician','scientist',
+    'business','royalty','writer'].includes(key)) return false;
 
-  // Fictional sub-type contradictions
   if (f['fic_marvel'] === true  && ['fic_dc','fic_disney','fic_anime'].includes(key)) return false;
   if (f['fic_dc']     === true  && ['fic_marvel','fic_disney','fic_anime'].includes(key)) return false;
   if (f['fic_disney'] === true  && ['fic_marvel','fic_dc','fic_anime'].includes(key)) return false;
   if (f['fic_anime']  === true  && ['fic_marvel','fic_dc','fic_disney'].includes(key)) return false;
 
-  // Domain contradictions — if one broad domain confirmed, skip others
   const domainKeys = ['athlete','entertainer','politician','scientist','business','royalty','writer','fictional'];
   const knownDomain = domainKeys.find(k => f[k] === true);
   if (knownDomain && domainKeys.includes(key) && key !== knownDomain) return false;
@@ -495,7 +455,7 @@ function shouldAsk(key, session) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  FACTS SUMMARY for GPT-4o guess prompt
+//  FACTS SUMMARY for GPT guess prompt
 // ─────────────────────────────────────────────────────────────────────────────
 function factsSummary(session) {
   const f = session.facts;
@@ -508,137 +468,236 @@ function factsSummary(session) {
   add(f.male    === false, 'female');
   add(f.alive   === true,  'alive');
   add(f.alive   === false, 'deceased');
-  add(f.historical=== true,'historical figure');
-  add(f.nat_arab=== true,  'Arab');
-  add(f.nat_american===true,'American');
-  add(f.nat_british===true,'British');
-  add(f.nat_french===true, 'French');
-  add(f.nat_spanish===true,'Spanish');
-  add(f.nat_portuguese===true,'Portuguese');
-  add(f.nat_argentine===true,'Argentine');
-  add(f.nat_brazilian===true,'Brazilian');
-  add(f.nat_german===true, 'German');
-  add(f.nat_italian===true,'Italian');
-  add(f.nat_russian===true,'Russian');
-  add(f.nat_australian===true,'Australian');
-  add(f.nat_swiss===true,  'Swiss');
-  add(f.nat_serbian===true,'Serbian');
-  add(f.nat_latin===true,  'Latin American');
-  add(f.nat_egyptian===true,'Egyptian');
-  add(f.nat_saudi===true,  'Saudi');
-  add(f.nat_kuwaiti===true,'Kuwaiti');
-  add(f.nat_emirati===true,'Emirati');
-  add(f.ach_worldcup===true,'won World Cup');
-  add(f.ach_ballondor===true,"won Ballon d'Or");
-  add(f.ach_ucl===true,'won Champions League');
-  add(f.ach_oscar===true,'won Oscar');
-  add(f.ach_grammy===true,'won Grammy');
-  add(f.ach_nobel===true,'won Nobel Prize');
-  add(f.ach_olympics===true,'won Olympic medal');
-  add(f.ach_grandslam===true,'won Grand Slam');
-  add(f.era_active===true,'still active now');
-  add(f.era_90s===true,'rose to fame in 90s');
-  add(f.era_80s===true,'rose to fame in 80s');
-  add(f.nat_s_american===true,'South American');
-  add(f.nat_european===true,'European');
-  add(f.pos_striker===true,'striker/forward');
-  add(f.pos_goalkeeper===true,'goalkeeper');
-  add(f.pos_midfielder===true,'midfielder');
-  add(f.pos_defender===true,'defender');
-  add(f.club_real===true,'played for Real Madrid');
-  add(f.club_barca===true,'played for Barcelona');
-  add(f.club_manu===true,'played for Man United');
-  add(f.club_liver===true,'played for Liverpool');
-  add(f.work_action===true,'known for action movies/films');
-  add(f.work_superhero===true,'played superhero role');
-  add(f.work_tv===true,'famous from TV show/series');
-  add(f.work_comedy===true,'known for comedy');
-  add(f.work_standup===true,'stand-up comedian');
-  add(f.style_pop===true,'pop singer');
-  add(f.style_band===true,'part of a band');
-  add(f.style_rap===true,'rapper');
-  add(f.fic_marvel===true,'from Marvel');
-  add(f.fic_dc===true,'from DC');
-  add(f.fic_disney===true,'from Disney');
-  add(f.fic_anime===true,'from anime');
-  add(f.fic_superhero===true,'superhero');
-  add(f.fic_villain===true,'villain');
-  add(f.fic_fly===true,'can fly');
-  add(f.fic_powers===true,'has superpowers');
-  add(f.fic_game===true,'from a video game');
-  add(f.field_physics===true,'physics');
-  add(f.field_medicine===true,'medicine');
-  add(f.field_tech===true,'technology');
-  add(f.weight_heavy===true,'heavyweight');
-  add(f.role_president===true,'served as president/head of state');
-  add(f.role_king===true,'king/queen/prince');
-  add(f.type_novelist===true,'novelist');
-  add(f.type_poet===true,'poet');
+  add(f.historical === true, 'historical figure');
+  add(f.nat_arab === true,   'Arab');
+  add(f.nat_american === true, 'American');
+  add(f.nat_british === true,  'British');
+  add(f.nat_french === true,   'French');
+  add(f.nat_spanish === true,  'Spanish');
+  add(f.nat_portuguese === true, 'Portuguese');
+  add(f.nat_argentine === true, 'Argentine');
+  add(f.nat_brazilian === true, 'Brazilian');
+  add(f.nat_german === true,   'German');
+  add(f.nat_italian === true,  'Italian');
+  add(f.nat_russian === true,  'Russian');
+  add(f.nat_australian === true, 'Australian');
+  add(f.nat_swiss === true,    'Swiss');
+  add(f.nat_serbian === true,  'Serbian');
+  add(f.nat_latin === true,    'Latin American');
+  add(f.nat_egyptian === true, 'Egyptian');
+  add(f.nat_saudi === true,    'Saudi');
+  add(f.nat_kuwaiti === true,  'Kuwaiti');
+  add(f.nat_emirati === true,  'Emirati');
+  add(f.ach_worldcup === true, 'won World Cup');
+  add(f.ach_ballondor === true, "won Ballon d'Or");
+  add(f.ach_ucl === true,    'won Champions League');
+  add(f.ach_oscar === true,   'won Oscar');
+  add(f.ach_grammy === true,  'won Grammy');
+  add(f.ach_nobel === true,   'won Nobel Prize');
+  add(f.ach_olympics === true,'won Olympic medal');
+  add(f.ach_grandslam === true,'won Grand Slam');
+  add(f.era_active === true,  'still active now');
+  add(f.era_90s === true,     'rose to fame in 90s');
+  add(f.era_80s === true,     'rose to fame in 80s');
+  add(f.nat_s_american === true, 'South American');
+  add(f.nat_european === true,   'European');
+  add(f.pos_striker === true,    'striker/forward');
+  add(f.pos_goalkeeper === true, 'goalkeeper');
+  add(f.pos_midfielder === true, 'midfielder');
+  add(f.pos_defender === true,   'defender');
+  add(f.club_real === true,   'played for Real Madrid');
+  add(f.club_barca === true,  'played for Barcelona');
+  add(f.club_manu === true,   'played for Man United');
+  add(f.club_liver === true,  'played for Liverpool');
+  add(f.work_action === true, 'known for action movies/films');
+  add(f.work_superhero === true, 'played superhero role');
+  add(f.work_tv === true,     'famous from TV show/series');
+  add(f.work_comedy === true, 'known for comedy');
+  add(f.work_standup === true,'stand-up comedian');
+  add(f.style_pop === true,   'pop singer');
+  add(f.style_band === true,  'part of a band');
+  add(f.style_rap === true,   'rapper');
+  add(f.fic_marvel === true,  'from Marvel');
+  add(f.fic_dc === true,      'from DC');
+  add(f.fic_disney === true,  'from Disney');
+  add(f.fic_anime === true,   'from anime');
+  add(f.fic_superhero === true, 'superhero');
+  add(f.fic_villain === true, 'villain');
+  add(f.fic_fly === true,     'can fly');
+  add(f.fic_powers === true,  'has superpowers');
+  add(f.fic_game === true,    'from a video game');
+  add(f.field_physics === true,   'physics');
+  add(f.field_medicine === true,  'medicine');
+  add(f.field_tech === true,      'technology');
+  add(f.weight_heavy === true,    'heavyweight');
+  add(f.role_president === true,  'served as president/head of state');
+  add(f.role_king === true,       'king/queen/prince');
+  add(f.type_novelist === true,   'novelist');
+  add(f.type_poet === true,       'poet');
 
-  // Negative facts that help narrow down
-  const trueNat = ['nat_arab','nat_american','nat_british','nat_french','nat_spanish',
+  const allNatKeys = ['nat_arab','nat_american','nat_british','nat_french','nat_spanish',
     'nat_portuguese','nat_argentine','nat_brazilian','nat_german','nat_italian',
     'nat_dutch','nat_russian','nat_australian','nat_swiss','nat_serbian','nat_latin',
     'nat_egyptian','nat_saudi','nat_kuwaiti','nat_emirati'];
-  const noNats = trueNat.filter(k => f[k] === false).map(k => k.replace('nat_',''));
+  const noNats = allNatKeys.filter(k => f[k] === false).map(k => k.replace('nat_',''));
   if (noNats.length) parts.push(`NOT: ${noNats.join(', ')}`);
 
   return parts.join(' | ') || 'no confirmed facts yet';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  GPT-4o GUESS
+//  WIKIPEDIA — fetch photo + bio (with English fallback for image)
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchWiki(name, lang) {
+  const primaryLang = lang === 'ar' ? 'ar' : 'en';
+  const title = encodeURIComponent(String(name).replace(/ /g, '_'));
+
+  async function fetchFromLang(l) {
+    const res = await fetch(
+      `https://${l}.wikipedia.org/api/rest_v1/page/summary/${title}`,
+      { signal: AbortSignal.timeout(6000) }
+    );
+    if (!res.ok) throw new Error(`${l} wiki not found`);
+    return res.json();
+  }
+
+  try {
+    let j = await fetchFromLang(primaryLang);
+    let imageURL = j.thumbnail?.source ?? null;
+
+    // If Arabic Wikipedia has no image, try English Wikipedia for the image
+    if (!imageURL && primaryLang === 'ar') {
+      try {
+        const enJ = await fetchFromLang('en');
+        imageURL = enJ.thumbnail?.source ?? null;
+      } catch {
+        // English fallback failed, keep imageURL as null
+      }
+    }
+
+    return {
+      title:      j.title ?? name,
+      extract:    j.extract ?? '',
+      imageURL,
+      articleURL: j.content_urls?.desktop?.page ?? `https://${primaryLang}.wikipedia.org/wiki/${title}`,
+    };
+  } catch {
+    // Primary language failed entirely — try English as full fallback
+    if (primaryLang === 'ar') {
+      try {
+        const enJ = await fetchFromLang('en');
+        return {
+          title:      enJ.title ?? name,
+          extract:    enJ.extract ?? '',
+          imageURL:   enJ.thumbnail?.source ?? null,
+          articleURL: enJ.content_urls?.desktop?.page ?? `https://en.wikipedia.org/wiki/${title}`,
+        };
+      } catch {
+        // both failed
+      }
+    }
+
+    return {
+      title:      name,
+      extract:    lang === 'ar' ? 'لا توجد معلومات متاحة' : 'No information available',
+      imageURL:   null,
+      articleURL: `https://${primaryLang}.wikipedia.org/wiki/${title}`,
+    };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PARSE JSON from AI response safely (no response_format dependency)
+// ─────────────────────────────────────────────────────────────────────────────
+function parseGuessJSON(raw) {
+  const text = String(raw || '').trim()
+    .replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try {
+    const obj = JSON.parse(m[0]);
+    // Accept both "name" and "character" fields
+    const name = String(obj.name ?? obj.character ?? obj.guess ?? '').trim();
+    const confidence = typeof obj.confidence === 'number'
+      ? Math.min(1, Math.max(0, obj.confidence)) : 0.75;
+    if (!name) return null;
+    return { name, confidence };
+  } catch {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GPT GUESS — uses GPT ONLY for the final name, no response_format
 // ─────────────────────────────────────────────────────────────────────────────
 async function makeGuess(session) {
   const ar = session.language === 'ar';
-  const fallback = { type:'guess', name: ar ? 'شخصية مشهورة' : 'A famous person', confidence:0.2 };
+  const fallback = {
+    type: 'guess',
+    name: ar ? 'شخصية غير معروفة' : 'Unknown character',
+    confidence: 0.2,
+    wiki: null,
+  };
 
-  if (!openai) return fallback;
+  if (!openai) {
+    console.error('makeGuess: openai not configured');
+    return fallback;
+  }
 
-  const summary = factsSummary(session);
+  const summary  = factsSummary(session);
   const rejected = session.rejectedGuesses;
-  const qa = session.turns.map((t,i) => `Q${i+1}: ${t.question} → ${t.answer}`).join('\n');
+  const qa = session.turns.map((t, i) => `Q${i + 1}: ${t.question} → ${t.answer}`).join('\n');
 
   const system = ar
-    ? `أنت متخصص في تحديد الشخصيات. بناءً على الحقائق المؤكدة، خمّن الشخصية الأكثر احتمالاً.
-قواعد:
+    ? `أنت خبير في تحديد الشخصيات. بناءً على الحقائق المؤكدة، خمّن الشخصية الأكثر احتمالاً.
+قواعد صارمة:
 - اسم واحد فقط بالعربية كما هو معروف (مثال: "محمد صلاح"، "فيروز"، "رونالدو")
-- لا تكرر: [${rejected.join(', ')||'لا شيء'}]
-- JSON فقط بدون أي نص آخر: {"type":"guess","name":"...","confidence":0.9}`
+- لا تكرر هذه الأسماء: [${rejected.join(', ') || 'لا شيء'}]
+- أجب بـ JSON فقط بدون أي نص إضافي: {"name":"...","confidence":0.9}`
     : `You are a character identification expert. Based ONLY on confirmed facts, name the single most likely character.
-Rules:
+Strict rules:
 - Full name as commonly known (e.g. "Lionel Messi", "Tom Hanks", "Iron Man")
-- NEVER repeat: [${rejected.join(', ')||'none'}]
-- JSON only, no extra text: {"type":"guess","name":"...","confidence":0.9}`;
+- NEVER repeat: [${rejected.join(', ') || 'none'}]
+- Respond with JSON ONLY, no other text: {"name":"...","confidence":0.9}`;
 
   const user = `Confirmed facts: ${summary}
 Full Q&A:
 ${qa || 'none yet'}
-Rejected guesses: ${rejected.join(', ')||'none'}
-Make your single best guess now.`;
+Rejected guesses: ${rejected.join(', ') || 'none'}
+Output your single best guess as JSON now.`;
 
   try {
     const resp = await openai.chat.completions.create({
-      model, temperature:0.1, max_tokens:80,
-      response_format: { type:'json_object' },
-      messages: [{ role:'system', content:system }, { role:'user', content:user }],
+      model,
+      temperature: 0.1,
+      max_tokens: 100,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
     });
-    const parsed = JSON.parse(resp.choices[0]?.message?.content ?? '{}');
-    const name = String(parsed.name ?? '').trim();
-    if (!name || rejected.includes(name)) return fallback;
 
-    // Fetch Wikipedia photo + bio alongside the guess
+    const raw = resp.choices?.[0]?.message?.content ?? '';
+    console.log('makeGuess raw response:', raw);
+
+    const parsed = parseGuessJSON(raw);
+    if (!parsed) {
+      console.error('makeGuess: failed to parse JSON from:', raw);
+      return fallback;
+    }
+
+    const { name, confidence } = parsed;
+    if (rejected.map(r => r.toLowerCase()).includes(name.toLowerCase())) {
+      console.log('makeGuess: rejected name returned again:', name);
+      return fallback;
+    }
+
     const wiki = await fetchWiki(name, session.language);
+    console.log('makeGuess: guessed', name, '| imageURL:', wiki?.imageURL ?? 'none');
 
-    return {
-      type: 'guess',
-      name,
-      confidence: typeof parsed.confidence === 'number'
-        ? Math.min(1, Math.max(0, parsed.confidence)) : 0.75,
-      wiki,
-    };
+    return { type: 'guess', name, confidence, wiki };
   } catch (e) {
-    console.error('makeGuess:', e?.message);
+    console.error('makeGuess error:', e?.message);
     return fallback;
   }
 }
@@ -649,85 +708,53 @@ Make your single best guess now.`;
 async function runEngine(session) {
   const { questionsThisPhase: qCount, minQ, maxQ } = session;
 
-  // Must guess now (hit ceiling)
   if (qCount >= maxQ) {
     return makeGuess(session);
   }
 
-  // Still in question phase — get next structured question
   if (qCount < minQ) {
     const q = nextQuestion(session);
     if (q) {
       session.pendingKey = q.key;
-      return { type:'question', text: q.text };
+      return { type: 'question', text: q.text };
     }
-    // Exhausted all questions before minQ — guess anyway
     return makeGuess(session);
   }
 
-  // In the window [minQ, maxQ) — pick question or guess
   const q = nextQuestion(session);
-  if (!q) {
-    // No more questions to ask — guess
-    return makeGuess(session);
-  }
+  if (!q) return makeGuess(session);
 
-  // We have more questions, but maybe we're confident enough to guess?
-  // Simple heuristic: if we know domain + sub-domain + nationality + 1 achievement → guess
   const f = session.facts;
   const readyToGuess = session.subDomain
-    && (f.nat_arab===true || f.nat_american===true || f.nat_british===true ||
-        f.nat_french===true || f.nat_portuguese===true || f.nat_argentine===true ||
-        f.nat_brazilian===true || f.nat_spanish===true || f.nat_german===true ||
-        f.nat_egyptian===true || f.nat_saudi===true || f.nat_kuwaiti===true ||
-        f.nat_emirati===true || f.nat_australian===true || f.nat_russian===true)
-    && (f.ach_worldcup===true || f.ach_ballondor===true || f.ach_ucl===true ||
-        f.ach_oscar===true || f.ach_grammy===true || f.ach_nobel===true ||
-        f.ach_olympics===true || f.ach_grandslam===true ||
-        f.era_active!==null || f.era_90s!==null || f.era_80s!==null);
+    && (f.nat_arab === true || f.nat_american === true || f.nat_british === true ||
+        f.nat_french === true || f.nat_portuguese === true || f.nat_argentine === true ||
+        f.nat_brazilian === true || f.nat_spanish === true || f.nat_german === true ||
+        f.nat_egyptian === true || f.nat_saudi === true || f.nat_kuwaiti === true ||
+        f.nat_emirati === true || f.nat_australian === true || f.nat_russian === true)
+    && (f.ach_worldcup === true || f.ach_ballondor === true || f.ach_ucl === true ||
+        f.ach_oscar === true || f.ach_grammy === true || f.ach_nobel === true ||
+        f.ach_olympics === true || f.ach_grandslam === true ||
+        f.era_active != null || f.era_90s != null || f.era_80s != null);
 
   if (readyToGuess && qCount >= minQ) {
     return makeGuess(session);
   }
 
   session.pendingKey = q.key;
-  return { type:'question', text: q.text };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  WIKIPEDIA
-// ─────────────────────────────────────────────────────────────────────────────
-async function fetchWiki(name, lang) {
-  const l = lang === 'ar' ? 'ar' : 'en';
-  const title = encodeURIComponent(String(name).replace(/ /g,'_'));
-  try {
-    const res = await fetch(
-      `https://${l}.wikipedia.org/api/rest_v1/page/summary/${title}`,
-      { signal: AbortSignal.timeout(5000) }
-    );
-    if (!res.ok) throw new Error('not found');
-    const j = await res.json();
-    return {
-      title:      j.title ?? name,
-      extract:    j.extract ?? '',
-      imageURL:   j.thumbnail?.source ?? null,
-      articleURL: j.content_urls?.desktop?.page ?? `https://${l}.wikipedia.org/wiki/${title}`,
-    };
-  } catch {
-    return {
-      title: name,
-      extract: lang==='ar' ? 'لا توجد معلومات متاحة' : 'No information available',
-      imageURL: null,
-      articleURL: `https://${l}.wikipedia.org/wiki/${title}`,
-    };
-  }
+  return { type: 'question', text: q.text };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
+
 app.get('/api/health', (_req, res) => {
-  res.json({ ok:true, model, hasOpenAI:Boolean(openai) });
+  res.json({ ok: true, model, hasOpenAI: Boolean(openai) });
+});
+
+// Also expose /health for compatibility
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, model, hasOpenAI: Boolean(openai) });
 });
 
 // POST /api/game/start
@@ -741,85 +768,162 @@ app.post('/api/game/start', async (req, res) => {
     sessions.set(sessionId, session);
     const result = await runEngine(session);
     return res.json({ sessionId, ...result });
-  } catch(e) {
+  } catch (e) {
     console.error('start:', e);
-    return res.status(500).json({ error:'Failed to start game' });
+    return res.status(500).json({ error: 'Failed to start game' });
+  }
+});
+
+// POST /api/start  (alias for compatibility)
+app.post('/api/start', async (req, res) => {
+  try {
+    const language = req.body?.language === 'en' ? 'en' : 'ar';
+    const sessionId = crypto.randomUUID();
+    const session = newSession(language);
+    sessions.set(sessionId, session);
+    const result = await runEngine(session);
+    return res.json({ sessionId, ...result });
+  } catch (e) {
+    console.error('start:', e);
+    return res.status(500).json({ error: 'Failed to start game' });
   }
 });
 
 // POST /api/game/answer
 // Body: { sessionId, question, answer:"yes"|"no"|"maybe"|"dont_know" }
-// Returns: { type:"question", text } OR { type:"guess", name, confidence }
+// Returns: { type:"question", text } OR { type:"guess", name, confidence, wiki }
 app.post('/api/game/answer', async (req, res) => {
   try {
     const { sessionId, question, answer } = req.body ?? {};
     const session = sessions.get(String(sessionId ?? ''));
-    if (!session) return res.status(404).json({ error:'Session not found' });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
 
     session.expiresAt = Date.now() + SESSION_TTL;
 
     const normAnswer = (() => {
-      const m = { yes:'yes', no:'no', maybe:'maybe', dontknow:'dont_know', dont_know:'dont_know' };
-      return m[String(answer ?? '').trim().toLowerCase().replace(/[^a-z_]/g,'')] ?? 'dont_know';
+      const m = { yes: 'yes', no: 'no', maybe: 'maybe', dontknow: 'dont_know', dont_know: 'dont_know' };
+      return m[String(answer ?? '').trim().toLowerCase().replace(/[^a-z_]/g, '')] ?? 'dont_know';
     })();
 
-    // Use the key we stored when sending the question
     const key = session.pendingKey ?? 'unknown';
     session.askedKeys.add(key);
     session.pendingKey = null;
     session.turns.push({ key, question: String(question ?? ''), answer: normAnswer });
     session.questionsThisPhase += 1;
 
-    // Update domain/facts
     applyAnswer(session, key, normAnswer);
 
     return res.json(await runEngine(session));
-  } catch(e) {
+  } catch (e) {
     console.error('answer:', e);
-    return res.status(500).json({ error:'Failed to process answer' });
+    return res.status(500).json({ error: 'Failed to process answer' });
+  }
+});
+
+// POST /api/next  (alias — accepts optional answer to record, then returns next step)
+// Body: { sessionId, answer?: "yes|no|maybe|dont_know", question?: "..." }
+app.post('/api/next', async (req, res) => {
+  try {
+    const { sessionId, question, answer } = req.body ?? {};
+    const session = sessions.get(String(sessionId ?? ''));
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    session.expiresAt = Date.now() + SESSION_TTL;
+
+    if (answer) {
+      const normAnswer = (() => {
+        const m = { yes: 'yes', no: 'no', maybe: 'maybe', dontknow: 'dont_know', dont_know: 'dont_know' };
+        return m[String(answer).trim().toLowerCase().replace(/[^a-z_]/g, '')] ?? 'dont_know';
+      })();
+
+      const key = session.pendingKey ?? 'unknown';
+      session.askedKeys.add(key);
+      session.pendingKey = null;
+      session.turns.push({ key, question: String(question ?? session.pendingKey ?? ''), answer: normAnswer });
+      session.questionsThisPhase += 1;
+      applyAnswer(session, key, normAnswer);
+    }
+
+    const result = await runEngine(session);
+    return res.json({ result });
+  } catch (e) {
+    console.error('next:', e);
+    return res.status(500).json({ error: 'Failed to process' });
   }
 });
 
 // POST /api/game/guess-confirm
 // Body: { sessionId, guessName, correct:true|false }
-// Returns:
-//   correct=true  → { type:"revealed", guessName, wiki:{title,extract,imageURL,articleURL} }
-//   wrong < 3     → { type:"guess", name, confidence }  (immediate next guess)
-//   wrong = 3     → { type:"question", text }            (back to questions, same domain)
 app.post('/api/game/guess-confirm', async (req, res) => {
   try {
     const { sessionId, guessName, correct } = req.body ?? {};
     const session = sessions.get(String(sessionId ?? ''));
-    if (!session) return res.status(404).json({ error:'Session not found' });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
 
     session.expiresAt = Date.now() + SESSION_TTL;
 
     if (correct) {
       const wiki = await fetchWiki(String(guessName ?? ''), session.language);
-      return res.json({ type:'revealed', guessName, wiki });
+      return res.json({ type: 'revealed', guessName, wiki });
     }
 
-    // Wrong guess
     if (guessName) session.rejectedGuesses.push(String(guessName));
     session.guessStreak += 1;
 
-    // Guess 2 or 3: try another guess immediately (no questions between)
     if (session.guessStreak < MAX_GUESSES) {
       return res.json(await makeGuess(session));
     }
 
-    // After 3 wrong guesses → back to questions
-    // Domain context is PRESERVED — we continue with the same domain lists
-    // Only reset the question counter for the new phase
     session.guessStreak = 0;
     session.questionsThisPhase = 0;
     session.minQ = FOLLOWUP_MIN;
     session.maxQ = FOLLOWUP_MAX;
 
     return res.json(await runEngine(session));
-  } catch(e) {
+  } catch (e) {
     console.error('guess-confirm:', e);
-    return res.status(500).json({ error:'Failed to confirm guess' });
+    return res.status(500).json({ error: 'Failed to confirm guess' });
+  }
+});
+
+// POST /api/guess-result  (alias for compatibility)
+app.post('/api/guess-result', async (req, res) => {
+  try {
+    const { sessionId, correct, guessedName } = req.body ?? {};
+    const session = sessions.get(String(sessionId ?? ''));
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    session.expiresAt = Date.now() + SESSION_TTL;
+
+    if (correct) {
+      const wiki = await fetchWiki(String(guessedName ?? ''), session.language);
+      sessions.delete(sessionId);
+      return res.json({ ok: true, won: true, wiki });
+    }
+
+    const name = String(guessedName || '').trim();
+    if (name && !session.rejectedGuesses.includes(name)) session.rejectedGuesses.push(name);
+    session.guessStreak += 1;
+
+    if (session.guessStreak >= MAX_GUESSES) {
+      sessions.delete(sessionId);
+      return res.json({
+        ok: true, won: false, gaveUp: true,
+        message: session.language === 'ar'
+          ? 'لم أستطع معرفة الشخصية. أنت الفائز!'
+          : "I couldn't figure it out. You win!"
+      });
+    }
+
+    session.guessStreak = 0;
+    session.questionsThisPhase = 0;
+    session.minQ = FOLLOWUP_MIN;
+    session.maxQ = FOLLOWUP_MAX;
+
+    return res.json({ ok: true, won: false, gaveUp: false });
+  } catch (e) {
+    console.error('guess-result:', e);
+    return res.status(500).json({ error: 'Failed' });
   }
 });
 
@@ -828,20 +932,37 @@ app.get('/api/wiki', async (req, res) => {
   try {
     const name = String(req.query.name ?? '');
     const lang = req.query.language === 'en' ? 'en' : 'ar';
-    if (!name) return res.status(400).json({ error:'name is required' });
+    if (!name) return res.status(400).json({ error: 'name is required' });
     return res.json(await fetchWiki(name, lang));
-  } catch(e) {
+  } catch (e) {
     console.error('wiki:', e);
-    return res.status(500).json({ error:'Failed to fetch wiki' });
+    return res.status(500).json({ error: 'Failed to fetch wiki' });
   }
+});
+
+// GET /api/session/:id  (debug)
+app.get('/api/session/:id', (req, res) => {
+  const s = sessions.get(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Session not found' });
+  res.json({
+    sessionId: req.params.id,
+    language: s.language,
+    turns: s.turns.length,
+    domain: s.domain,
+    subDomain: s.subDomain,
+    rejectedGuesses: s.rejectedGuesses,
+    guessStreak: s.guessStreak,
+    questionsThisPhase: s.questionsThisPhase,
+    phase: { min: s.minQ, max: s.maxQ },
+    facts: s.facts,
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  START
 // ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`✅ Magic Ball  →  http://localhost:${PORT}`);
-  console.log(`🤖 Model: ${MODEL} | OpenAI: ${Boolean(openai)}`);
-  console.log(`📋 Phase 1: ${INITIAL_MIN}–${INITIAL_MAX} questions → up to ${MAX_GUESSES} guesses`);
-  console.log(`🔁 Phase 2: ${FOLLOWUP_MIN}–${FOLLOWUP_MAX} domain-specific questions → guess again`);
+  console.log(`Magic Ball server → port ${PORT}`);
+  console.log(`Model: ${MODEL} | OpenAI: ${Boolean(openai)}`);
+  console.log(`Phase 1: ${INITIAL_MIN}–${INITIAL_MAX} questions | Phase 2: ${FOLLOWUP_MIN}–${FOLLOWUP_MAX}`);
 });
