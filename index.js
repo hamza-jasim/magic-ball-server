@@ -668,7 +668,7 @@ Output your single best guess as JSON now.`;
 
   try {
     const resp = await openai.chat.completions.create({
-      model,
+  model: MODEL, // ← صحيح
       temperature: 0.1,
       max_tokens: 100,
       messages: [
