@@ -741,31 +741,69 @@ async function runEngine(session) {
 //  WIKIPEDIA
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchWiki(name, lang) {
-  const l = lang === 'ar' ? 'ar' : 'en';
-  const title = encodeURIComponent(String(name).replace(/ /g,'_'));
-  try {
-    const res = await fetch(
-      `https://${l}.wikipedia.org/api/rest_v1/page/summary/${title}`,
-      { signal: AbortSignal.timeout(5000) }
-    );
-    if (!res.ok) throw new Error('not found');
+  const requestedLang = lang === 'ar' ? 'ar' : 'en';
+  const fallbackLangs = requestedLang === 'ar' ? ['ar', 'en'] : ['en', 'ar'];
+
+  async function fetchSummaryByTitle(language, title) {
+    const encodedTitle = encodeURIComponent(String(title).replace(/ /g, '_'));
+    const url = `https://${language}.wikipedia.org/api/rest_v1/page/summary/${encodedTitle}`;
+
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`summary not found: ${language}:${title}`);
+
     const j = await res.json();
+
     return {
-      title:      j.title ?? name,
-      extract:    j.extract ?? '',
-      imageURL:   j.thumbnail?.source ?? null,
-      articleURL: j.content_urls?.desktop?.page ?? `https://${l}.wikipedia.org/wiki/${title}`,
-    };
-  } catch {
-    return {
-      title: name,
-      extract: lang==='ar' ? 'لا توجد معلومات متاحة' : 'No information available',
-      imageURL: null,
-      articleURL: `https://${l}.wikipedia.org/wiki/${title}`,
+      title: j.title || title,
+      extract: j.extract || '',
+      imageURL: j.thumbnail?.source || null,
+      articleURL: j.content_urls?.desktop?.page || `https://${language}.wikipedia.org/wiki/${encodedTitle}`,
     };
   }
-}
 
+  async function searchTitle(language, query) {
+    const url = `https://${language}.wikipedia.org/w/rest.php/v1/search/title?q=${encodeURIComponent(query)}&limit=1`;
+
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`search failed: ${language}:${query}`);
+
+    const j = await res.json();
+    const first = j?.pages?.[0];
+
+    if (!first?.title) throw new Error(`no search result: ${language}:${query}`);
+    return first.title;
+  }
+
+  const candidates = [
+    name,
+    String(name).replace(/_/g, ' ').trim(),
+    String(name).replace(/\s+/g, ' ').trim(),
+  ].filter(Boolean);
+
+  for (const language of fallbackLangs) {
+    for (const candidate of candidates) {
+      try {
+        return await fetchSummaryByTitle(language, candidate);
+      } catch {}
+    }
+
+    for (const candidate of candidates) {
+      try {
+        const foundTitle = await searchTitle(language, candidate);
+        return await fetchSummaryByTitle(language, foundTitle);
+      } catch {}
+    }
+  }
+
+  return {
+    title: name,
+    extract: requestedLang === 'ar'
+      ? 'لا توجد معلومات متاحة'
+      : 'No information available',
+    imageURL: null,
+    articleURL: null,
+  };
+}
 // ─────────────────────────────────────────────────────────────────────────────
 //  ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -838,14 +876,16 @@ app.post('/api/game/guess-confirm', async (req, res) => {
     session.expiresAt = Date.now() + SESSION_TTL;
 
     if (correct) {
-      const wiki = await fetchWiki(String(guessName ?? ''), session.language);
-      return res.json({
-        type: 'revealed',
-        name: guessName,
-        guessName,
-        wiki,
-      });
-    }
+  const finalGuessName = String(guessName ?? '').trim();
+  const wiki = await fetchWiki(finalGuessName, session.language);
+
+  return res.json({
+    type: 'revealed',
+    name: wiki?.title || finalGuessName,
+    guessName: wiki?.title || finalGuessName,
+    wiki,
+  });
+}
 
     // Wrong guess
     if (guessName) session.rejectedGuesses.push(String(guessName));
@@ -893,4 +933,3 @@ app.listen(PORT, () => {
   console.log(`📋 Phase 1: ${INITIAL_MIN}–${INITIAL_MAX} questions → up to ${MAX_GUESSES} guesses`);
   console.log(`🔁 Phase 2: ${FOLLOWUP_MIN}–${FOLLOWUP_MAX} domain-specific questions → guess again`);
 });
-=
