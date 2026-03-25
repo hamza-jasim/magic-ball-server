@@ -8,28 +8,40 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// 🔴 مهم: تأكد عندك API KEY بالـ ENV
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
 const MODEL = "gpt-4o-mini";
 
-// 🧠 prompt بسيط
+// 🧠 Prompt بسيط
 const SYSTEM_PROMPT = `
 You are an AI like Akinator.
-Ask ONLY one yes/no question each time.
 
-After around 7 questions, make a guess like:
+Rules:
+- Ask ONLY one yes/no question
+- No explanations
+- After some questions say:
 My guess: [name]
-
-No explanations.
 `;
 
+// 🟢 اختبار السيرفر
+app.get("/", (req, res) => {
+  res.send("Server is working ✅");
+});
+
+// 🟢 health
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true });
+});
+
 // 🟢 start
-app.post("/api/start", async (req, res) => {
+app.post("/api/start", (req, res) => {
   res.json({
     messages: [],
-    question: "Is the person you're thinking of real?"
+    text: "Is the person real?",
+    isGuess: false
   });
 });
 
@@ -37,6 +49,10 @@ app.post("/api/start", async (req, res) => {
 app.post("/api/answer", async (req, res) => {
   try {
     const { messages } = req.body;
+
+    if (!messages) {
+      return res.status(400).json({ error: "messages required" });
+    }
 
     const response = await openai.chat.completions.create({
       model: MODEL,
@@ -47,7 +63,6 @@ app.post("/api/answer", async (req, res) => {
     });
 
     const text = response.choices[0]?.message?.content || "";
-
     const isGuess = text.includes("My guess:");
 
     res.json({
@@ -55,18 +70,15 @@ app.post("/api/answer", async (req, res) => {
       isGuess
     });
 
-  } catch (e) {
-    console.error(e);
+  } catch (err) {
+    console.error("ERROR:", err.message);
     res.status(500).json({ error: "AI failed" });
   }
 });
 
-// 🟢 health
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true });
-});
-
+// 🔴 مهم جداً ل Railway
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+
+app.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port", PORT);
 });
