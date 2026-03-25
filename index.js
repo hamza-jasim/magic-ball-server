@@ -626,11 +626,22 @@ Make your single best guess now.`;
     const parsed = JSON.parse(resp.choices[0]?.message?.content ?? '{}');
     const name = String(parsed.name ?? '').trim();
     if (!name || rejected.includes(name)) return fallback;
+
+    // Fetch Wikipedia photo + bio alongside the guess
+    const wiki = await fetchWiki(name, session.language);
+
+    const text = ar
+      ? `هل الشخصية التي تفكر بها هي ${name}؟`
+      : `Is the character you're thinking of ${name}?`;
+
     return {
       type: 'guess',
       name,
+      guessName: name,
+      text,
       confidence: typeof parsed.confidence === 'number'
         ? Math.min(1, Math.max(0, parsed.confidence)) : 0.75,
+      wiki,
     };
   } catch (e) {
     console.error('makeGuess:', e?.message);
@@ -840,3 +851,4 @@ app.listen(PORT, () => {
   console.log(`📋 Phase 1: ${INITIAL_MIN}–${INITIAL_MAX} questions → up to ${MAX_GUESSES} guesses`);
   console.log(`🔁 Phase 2: ${FOLLOWUP_MIN}–${FOLLOWUP_MAX} domain-specific questions → guess again`);
 });
+=
