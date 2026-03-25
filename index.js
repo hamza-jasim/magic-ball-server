@@ -1,804 +1,699 @@
-import express from 'express';
-import cors from 'cors';
-import OpenAI from 'openai';
-import crypto from 'node:crypto';
+/**
+ * Magic Ball — "20 Questions" AI character guessing game
+ * Architecture:
+ *   • Questions come from STATIC ordered lists per domain (zero repetition, zero drift)
+ *   • GPT-4o is used ONLY for making the final guess
+ *   • Domain is locked the moment a broad category is confirmed
+ *   • Sub-domain narrows the list further (footballer ≠ boxer ≠ swimmer)
+ *   • State is stored explicitly in the session — no re-parsing of question text
+ */
 
-const app = express();
+import express from 'express';
+import cors    from 'cors';
+import OpenAI  from 'openai';
+import crypto  from 'node:crypto';
+
+const app  = express();
 app.use(cors());
 app.use(express.json());
 
-const port = Number(process.env.PORT || 3001);
-const model = process.env.OPENAI_MODEL || 'gpt-4o';
+const PORT  = Number(process.env.PORT  || 3001);
+const MODEL = process.env.OPENAI_MODEL || 'gpt-4o';
 
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
   : null;
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  CONSTANTS
+// ─────────────────────────────────────────────────────────────────────────────
 const INITIAL_MIN  = 9;
 const INITIAL_MAX  = 15;
 const FOLLOWUP_MIN = 5;
 const FOLLOWUP_MAX = 8;
-const MAX_CONSECUTIVE_GUESSES = 3;
-const SESSION_TTL_MS = 60 * 60 * 1000;
+const MAX_GUESSES  = 3;          // wrong guesses before going back to questions
+const SESSION_TTL  = 60 * 60 * 1000;
 
-// ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  QUESTION BANK
+//  Format per entry: { key, ar, en }
+//  • key  = unique concept id — used to prevent repeats and drive state updates
+//  • ar   = Arabic question text
+//  • en   = English question text
+//  Questions are tried in order; already-asked keys and contradictions are skipped.
+// ─────────────────────────────────────────────────────────────────────────────
+const Q = {
+
+  // ── STEP 1: Broad category (asked before domain is known) ─────────────────
+  broad: [
+    { key:'real',        ar:'هل هو شخص حقيقي؟',              en:'Is it a real person?' },
+    { key:'male',        ar:'هل هو رجل؟',                    en:'Is it male?' },
+    { key:'athlete',     ar:'هل هو رياضي؟',                  en:'Is it an athlete?' },
+    { key:'entertainer', ar:'هل هو فنان أو نجم؟',            en:'Is it an entertainer?' },
+    { key:'politician',  ar:'هل هو سياسي؟',                  en:'Is it a politician?' },
+    { key:'scientist',   ar:'هل هو عالم أو مخترع؟',          en:'Is it a scientist or inventor?' },
+    { key:'business',    ar:'هل هو رجل أعمال مشهور؟',        en:'Is it a famous businessperson?' },
+    { key:'royalty',     ar:'هل هو ملكي (ملك أو أمير)؟',     en:'Is it royalty (king/queen/prince)?' },
+    { key:'writer',      ar:'هل هو كاتب أو شاعر؟',           en:'Is it a writer or poet?' },
+    { key:'alive',       ar:'هل هو حي؟',                     en:'Is it alive?' },
+    { key:'historical',  ar:'هل هو شخصية تاريخية قديمة؟',    en:'Is it an ancient historical figure?' },
+    { key:'fictional',   ar:'هل هو شخصية خيالية أو كرتونية؟',en:'Is it a fictional or animated character?' },
+  ],
+
+  // ── STEP 2a: Athlete — find the sport ─────────────────────────────────────
+  athlete_sport: [
+    { key:'sport_football',   ar:'هل يلعب كرة القدم؟',       en:'Does it play football/soccer?' },
+    { key:'sport_basketball', ar:'هل يلعب كرة السلة؟',       en:'Does it play basketball?' },
+    { key:'sport_tennis',     ar:'هل يلعب التنس؟',           en:'Does it play tennis?' },
+    { key:'sport_boxing',     ar:'هل هو ملاكم؟',             en:'Is it a boxer?' },
+    { key:'sport_swimming',   ar:'هل هو سباح؟',              en:'Is it a swimmer?' },
+    { key:'sport_golf',       ar:'هل يلعب الغولف؟',          en:'Does it play golf?' },
+    { key:'sport_other',      ar:'هل هو رياضي أولمبي؟',      en:'Is it an Olympic athlete?' },
+  ],
+
+  // ── STEP 2b: Entertainer — find the sub-type ──────────────────────────────
+  entertainer_type: [
+    { key:'ent_actor',    ar:'هل هو ممثل؟',                  en:'Is it an actor or actress?' },
+    { key:'ent_singer',   ar:'هل هو مغني؟',                  en:'Is it a singer?' },
+    { key:'ent_director', ar:'هل هو مخرج أفلام؟',           en:'Is it a film director?' },
+    { key:'ent_comedian', ar:'هل هو كوميديان؟',              en:'Is it a comedian?' },
+    { key:'ent_presenter',ar:'هل هو مقدم أو مذيع؟',         en:'Is it a TV presenter or host?' },
+  ],
+
+  // ── STEP 3: Footballer ────────────────────────────────────────────────────
+  footballer: [
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'nat_s_american',ar:'هل هو من أمريكا الجنوبية؟',   en:'Is it South American?' },
+    { key:'nat_european',  ar:'هل هو أوروبي؟',               en:'Is it European?' },
+    { key:'ach_worldcup',  ar:'هل فاز بكأس العالم؟',         en:'Did it win the World Cup?' },
+    { key:'ach_ballondor', ar:'هل فاز بجائزة البالون دور؟',  en:"Did it win the Ballon d'Or?" },
+    { key:'ach_ucl',       ar:'هل فاز بدوري أبطال أوروبا؟', en:'Did it win the Champions League?' },
+    { key:'era_active',    ar:'هل لا يزال يلعب الآن؟',       en:'Is it still playing now?' },
+    { key:'nat_portuguese',ar:'هل هو برتغالي؟',              en:'Is it Portuguese?' },
+    { key:'nat_argentine', ar:'هل هو أرجنتيني؟',             en:'Is it Argentine?' },
+    { key:'nat_brazilian', ar:'هل هو برازيلي؟',              en:'Is it Brazilian?' },
+    { key:'nat_french',    ar:'هل هو فرنسي؟',                en:'Is it French?' },
+    { key:'nat_spanish',   ar:'هل هو إسباني؟',               en:'Is it Spanish?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'nat_german',    ar:'هل هو ألماني؟',               en:'Is it German?' },
+    { key:'nat_egyptian',  ar:'هل هو مصري؟',                 en:'Is it Egyptian?' },
+    { key:'nat_saudi',     ar:'هل هو سعودي؟',                en:'Is it Saudi?' },
+    { key:'pos_striker',   ar:'هل هو مهاجم؟',                en:'Is it a striker/forward?' },
+    { key:'pos_goalkeeper',ar:'هل هو حارس مرمى؟',            en:'Is it a goalkeeper?' },
+    { key:'pos_midfielder',ar:'هل هو لاعب وسط؟',             en:'Is it a midfielder?' },
+    { key:'pos_defender',  ar:'هل هو مدافع؟',                en:'Is it a defender?' },
+    { key:'club_real',     ar:'هل لعب في ريال مدريد؟',       en:'Did it play for Real Madrid?' },
+    { key:'club_barca',    ar:'هل لعب في برشلونة؟',          en:'Did it play for Barcelona?' },
+    { key:'club_manu',     ar:'هل لعب في مانشستر يونايتد؟',  en:'Did it play for Man United?' },
+    { key:'club_liver',    ar:'هل لعب في ليفربول؟',          en:'Did it play for Liverpool?' },
+    { key:'era_90s',       ar:'هل اشتهر في التسعينيات؟',     en:'Did it rise to fame in the 90s?' },
+    { key:'nat_italian',   ar:'هل هو إيطالي؟',               en:'Is it Italian?' },
+    { key:'nat_dutch',     ar:'هل هو هولندي؟',               en:'Is it Dutch?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Basketballer ─────────────────────────────────────────────────
+  basketballer: [
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'era_active',    ar:'هل لا يزال يلعب الآن؟',       en:'Is it still playing now?' },
+    { key:'era_90s',       ar:'هل اشتهر في التسعينيات؟',     en:'Did it rise to fame in the 90s?' },
+    { key:'ach_olympics',  ar:'هل فاز بميدالية أولمبية؟',    en:'Did it win an Olympic medal?' },
+    { key:'nat_european',  ar:'هل هو أوروبي؟',               en:'Is it European?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Tennis player ────────────────────────────────────────────────
+  tennis: [
+    { key:'nat_european',  ar:'هل هو أوروبي؟',               en:'Is it European?' },
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_spanish',   ar:'هل هو إسباني؟',               en:'Is it Spanish?' },
+    { key:'nat_swiss',     ar:'هل هو سويسري؟',               en:'Is it Swiss?' },
+    { key:'nat_serbian',   ar:'هل هو صربي؟',                 en:'Is it Serbian?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'era_active',    ar:'هل لا يزال يلعب الآن؟',       en:'Is it still playing now?' },
+    { key:'ach_grandslam', ar:'هل فاز ببطولة غراند سلام؟',   en:'Did it win a Grand Slam?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Boxer ────────────────────────────────────────────────────────
+  boxer: [
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'era_active',    ar:'هل لا يزال يتنافس الآن؟',     en:'Is it still competing now?' },
+    { key:'era_90s',       ar:'هل اشتهر في التسعينيات؟',     en:'Did it rise to fame in the 90s?' },
+    { key:'ach_olympics',  ar:'هل فاز بميدالية أولمبية؟',    en:'Did it win an Olympic gold?' },
+    { key:'weight_heavy',  ar:'هل هو في وزن ثقيل؟',         en:'Is it a heavyweight?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Swimmer ──────────────────────────────────────────────────────
+  swimmer: [
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_european',  ar:'هل هو أوروبي؟',               en:'Is it European?' },
+    { key:'ach_olympics',  ar:'هل فاز بميدالية أولمبية ذهبية؟',en:'Did it win Olympic gold?' },
+    { key:'era_active',    ar:'هل لا يزال يسبح الآن؟',       en:'Is it still competing now?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Actor ────────────────────────────────────────────────────────
+  actor: [
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'nat_french',    ar:'هل هو فرنسي؟',                en:'Is it French?' },
+    { key:'ach_oscar',     ar:'هل فاز بجائزة أوسكار؟',       en:'Did it win an Oscar?' },
+    { key:'work_action',   ar:'هل يمثل في أفلام أكشن؟',      en:'Is it known for action movies?' },
+    { key:'work_superhero',ar:'هل مثّل دور بطل خارق؟',       en:'Did it play a superhero?' },
+    { key:'work_tv',       ar:'هل اشتهر في مسلسل تلفزيوني؟',en:'Is it famous from a TV series?' },
+    { key:'era_active',    ar:'هل لا يزال يمثل الآن؟',       en:'Is it still acting now?' },
+    { key:'era_90s',       ar:'هل اشتهر في التسعينيات؟',     en:'Did it rise to fame in the 90s?' },
+    { key:'era_80s',       ar:'هل اشتهر في الثمانينيات؟',    en:'Did it rise to fame in the 80s?' },
+    { key:'nat_australian',ar:'هل هو أسترالي؟',              en:'Is it Australian?' },
+    { key:'nat_italian',   ar:'هل هو إيطالي؟',               en:'Is it Italian?' },
+    { key:'nat_egyptian',  ar:'هل هو مصري؟',                 en:'Is it Egyptian?' },
+    { key:'nat_saudi',     ar:'هل هو سعودي؟',                en:'Is it Saudi?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+    { key:'work_comedy',   ar:'هل يمثل في أفلام كوميدية؟',   en:'Is it known for comedy films?' },
+    { key:'work_drama',    ar:'هل يمثل في أفلام دراما؟',     en:'Is it known for drama films?' },
+  ],
+
+  // ── STEP 3: Singer ───────────────────────────────────────────────────────
+  singer: [
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'nat_egyptian',  ar:'هل هو مصري؟',                 en:'Is it Egyptian?' },
+    { key:'nat_saudi',     ar:'هل هو سعودي؟',                en:'Is it Saudi?' },
+    { key:'nat_kuwaiti',   ar:'هل هو كويتي؟',                en:'Is it Kuwaiti?' },
+    { key:'nat_emirati',   ar:'هل هو إماراتي؟',              en:'Is it Emirati?' },
+    { key:'nat_french',    ar:'هل هو فرنسي؟',                en:'Is it French?' },
+    { key:'nat_latin',     ar:'هل هو من أمريكا اللاتينية؟',  en:'Is it Latin American?' },
+    { key:'ach_grammy',    ar:'هل فاز بجائزة غرامي؟',        en:'Did it win a Grammy?' },
+    { key:'era_active',    ar:'هل لا يزال يغني الآن؟',       en:'Is it still singing now?' },
+    { key:'era_90s',       ar:'هل اشتهر في التسعينيات؟',     en:'Did it rise to fame in the 90s?' },
+    { key:'era_80s',       ar:'هل اشتهر في الثمانينيات؟',    en:'Did it rise to fame in the 80s?' },
+    { key:'style_pop',     ar:'هل يغني موسيقى بوب؟',         en:'Is it a pop singer?' },
+    { key:'style_band',    ar:'هل هو في فرقة موسيقية؟',      en:'Is it part of a band?' },
+    { key:'style_rap',     ar:'هل يغني راب أو هيب هوب؟',     en:'Is it a rapper or hip-hop artist?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Director ─────────────────────────────────────────────────────
+  director: [
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'ach_oscar',     ar:'هل فاز بأوسكار أفضل مخرج؟',  en:'Did it win Best Director Oscar?' },
+    { key:'work_action',   ar:'هل يخرج أفلام أكشن وإثارة؟',  en:'Is it known for action/thriller films?' },
+    { key:'work_scifi',    ar:'هل يخرج أفلام خيال علمي؟',    en:'Is it known for sci-fi films?' },
+    { key:'era_active',    ar:'هل لا يزال يخرج الآن؟',       en:'Is it still directing now?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Comedian ─────────────────────────────────────────────────────
+  comedian: [
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'work_tv',       ar:'هل اشتهر في برنامج تلفزيوني؟',en:'Is it famous from a TV show?' },
+    { key:'work_standup',  ar:'هل هو ستاند-أب كوميدي؟',      en:'Is it a stand-up comedian?' },
+    { key:'era_active',    ar:'هل لا يزال نشطاً الآن؟',      en:'Is it still active now?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Politician ───────────────────────────────────────────────────
+  politician: [
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'nat_french',    ar:'هل هو فرنسي؟',                en:'Is it French?' },
+    { key:'nat_russian',   ar:'هل هو روسي؟',                 en:'Is it Russian?' },
+    { key:'nat_saudi',     ar:'هل هو سعودي؟',                en:'Is it Saudi?' },
+    { key:'nat_egyptian',  ar:'هل هو مصري؟',                 en:'Is it Egyptian?' },
+    { key:'role_president',ar:'هل كان رئيساً لدولة؟',        en:'Did it serve as a country president?' },
+    { key:'role_king',     ar:'هل هو ملك أو أمير؟',          en:'Is it a king, queen, or prince?' },
+    { key:'role_minister', ar:'هل كان وزيراً أو رئيس وزراء؟',en:'Was it a prime minister or minister?' },
+    { key:'era_active',    ar:'هل لا يزال في منصبه الآن؟',   en:'Is it still in office now?' },
+    { key:'historical',    ar:'هل هو شخصية تاريخية قديمة؟',  en:'Is it an ancient historical figure?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Scientist ────────────────────────────────────────────────────
+  scientist: [
+    { key:'historical',    ar:'هل هو شخصية تاريخية؟',        en:'Is it a historical figure?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'nat_german',    ar:'هل هو ألماني؟',               en:'Is it German?' },
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'ach_nobel',     ar:'هل فاز بجائزة نوبل؟',         en:'Did it win a Nobel Prize?' },
+    { key:'field_physics', ar:'هل هو في مجال الفيزياء؟',     en:'Is it known for physics?' },
+    { key:'field_medicine',ar:'هل هو في مجال الطب؟',         en:'Is it known for medicine?' },
+    { key:'field_tech',    ar:'هل هو في مجال التكنولوجيا؟',  en:'Is it known for technology?' },
+    { key:'field_math',    ar:'هل هو في مجال الرياضيات؟',    en:'Is it known for mathematics?' },
+  ],
+
+  // ── STEP 3: Business ─────────────────────────────────────────────────────
+  business: [
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'field_tech',    ar:'هل هو في مجال التكنولوجيا؟',  en:'Is it in the tech industry?' },
+    { key:'era_active',    ar:'هل لا يزال نشطاً الآن؟',      en:'Is it still active now?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+    { key:'historical',    ar:'هل هو شخصية تاريخية؟',        en:'Is it a historical figure?' },
+  ],
+
+  // ── STEP 3: Royalty ──────────────────────────────────────────────────────
+  royalty: [
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'nat_european',  ar:'هل هو أوروبي؟',               en:'Is it European?' },
+    { key:'nat_saudi',     ar:'هل هو سعودي؟',                en:'Is it Saudi?' },
+    { key:'era_active',    ar:'هل لا يزال في منصبه؟',        en:'Is it still in power?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Writer ───────────────────────────────────────────────────────
+  writer: [
+    { key:'nat_arab',      ar:'هل هو عربي؟',                 en:'Is it Arab?' },
+    { key:'nat_british',   ar:'هل هو بريطاني؟',              en:'Is it British?' },
+    { key:'nat_american',  ar:'هل هو أمريكي؟',               en:'Is it American?' },
+    { key:'nat_french',    ar:'هل هو فرنسي؟',                en:'Is it French?' },
+    { key:'type_novelist', ar:'هل هو روائي (كاتب روايات)؟',  en:'Is it a novelist?' },
+    { key:'type_poet',     ar:'هل هو شاعر؟',                 en:'Is it a poet?' },
+    { key:'ach_nobel',     ar:'هل فاز بجائزة نوبل للأدب؟',   en:'Did it win the Nobel Prize in Literature?' },
+    { key:'historical',    ar:'هل هو شخصية تاريخية؟',        en:'Is it a historical figure?' },
+    { key:'alive',         ar:'هل هو حي؟',                   en:'Is it alive?' },
+  ],
+
+  // ── STEP 3: Fictional / Animated character ───────────────────────────────
+  fictional: [
+    { key:'fic_superhero', ar:'هل هو بطل خارق؟',             en:'Is it a superhero?' },
+    { key:'fic_villain',   ar:'هل هو شرير رئيسي؟',           en:'Is it a main villain?' },
+    { key:'fic_marvel',    ar:'هل هو من عالم مارفل؟',         en:'Is it from Marvel?' },
+    { key:'fic_dc',        ar:'هل هو من عالم DC؟',           en:'Is it from DC Comics?' },
+    { key:'fic_disney',    ar:'هل هو من ديزني؟',             en:'Is it from Disney?' },
+    { key:'fic_anime',     ar:'هل هو من أنيمي ياباني؟',      en:'Is it from a Japanese anime?' },
+    { key:'fic_movie',     ar:'هل هو من فيلم سينمائي؟',      en:'Is it from a movie?' },
+    { key:'fic_game',      ar:'هل هو من لعبة فيديو؟',        en:'Is it from a video game?' },
+    { key:'fic_fly',       ar:'هل يستطيع الطيران؟',           en:'Can it fly?' },
+    { key:'fic_powers',    ar:'هل لديه قوى خارقة؟',          en:'Does it have superpowers?' },
+    { key:'fic_human',     ar:'هل هو بشري؟',                 en:'Is it human?' },
+    { key:'male',          ar:'هل هو ذكر؟',                  en:'Is it male?' },
+  ],
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DOMAIN → QUESTION LIST MAPPING
+//  Once domain is locked, ONLY these lists are consulted (in order)
+// ─────────────────────────────────────────────────────────────────────────────
+const DOMAIN_LISTS = {
+  footballer:   ['footballer'],
+  basketballer: ['basketballer'],
+  tennis:       ['tennis'],
+  boxer:        ['boxer'],
+  swimmer:      ['swimmer'],
+  athlete:      ['athlete_sport'],           // broad athlete before sport known
+  actor:        ['actor'],
+  singer:       ['singer'],
+  director:     ['director'],
+  comedian:     ['comedian'],
+  entertainer:  ['entertainer_type'],        // broad entertainer before type known
+  politician:   ['politician'],
+  scientist:    ['scientist'],
+  business:     ['business'],
+  royalty:      ['royalty'],
+  writer:       ['writer'],
+  fictional:    ['fictional'],
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  SESSION STORE
-// ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 const sessions = new Map();
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) if (s.expiresAt < now) sessions.delete(id);
 }, 5 * 60 * 1000);
 
-// ──────────────────────────────────────────────────────────────
-//  HELPERS
-// ──────────────────────────────────────────────────────────────
-const normalize = (a) => {
-  const m = { yes:'yes', no:'no', maybe:'maybe', dontknow:'dont_know', dont_know:'dont_know' };
-  return m[String(a ?? '').trim().toLowerCase().replace(/[^a-z_]/g,'')] ?? 'dont_know';
-};
-
-// ──────────────────────────────────────────────────────────────
-//  STATE INFERENCE  — reads Q&A history into a flat object
-// ──────────────────────────────────────────────────────────────
-function inferState(turns) {
-  const S = {
-    // reality
-    real:null, fictional:null, animated:null,
-    // gender
-    male:null, female:null,
-    // status
-    alive:null, historical:null,
-    // broad domain
-    athlete:null, entertainer:null, politician:null,
-    scientist:null, business:null, royalty:null, writer:null,
-    // sport sub-domain (only one should be true)
-    footballer:null, basketballer:null, tennis_player:null, boxer:null, swimmer:null, golfer:null,
-    // entertainment sub-domain
-    actor:null, singer:null, director:null, comedian:null,
-    // nationality
-    arab:null, saudi:null, egyptian:null, emirati:null, kuwaiti:null,
-    american:null, british:null, french:null, spanish:null,
-    portuguese:null, argentine:null, brazilian:null,
-    german:null, italian:null, dutch:null,
-    // achievements
-    worldcup:null, ballon_dor:null, oscar:null, grammy:null,
-    olympics:null, nobel:null, champions_league:null,
-    // era
-    era_now:null, era_90s:null, era_80s:null, era_2000s:null,
-    // entertainment details
-    action_movies:null, superhero_role:null, tv_series:null, hollywood:null,
-    // sport details
-    striker:null, goalkeeper:null, defender:null, midfielder:null,
-    wears_10:null, national_team:null,
-    club_real:null, club_barca:null, club_manutd:null, club_chelsea:null, club_liverpool:null,
-    // fictional
-    hero:null, villain:null, marvel:null, dc:null, disney:null, anime:null,
-    can_fly:null, has_powers:null, from_movie:null, from_game:null,
+function newSession(language) {
+  return {
+    language,
+    turns: [],                // { key, question, answer }
+    askedKeys: new Set(),     // fast O(1) dedup — keys of all questions ever asked
+    pendingKey: null,         // key of the question that was just sent, waiting for answer
+    // Confirmed domain info (updated as answers come in)
+    domain: null,             // broad: 'athlete' | 'entertainer' | 'politician' | ...
+    subDomain: null,          // narrow: 'footballer' | 'actor' | 'singer' | ...
+    // Confirmed facts (updated as answers come in)
+    facts: {},                // key → true/false
+    rejectedGuesses: [],
+    guessStreak: 0,
+    questionsThisPhase: 0,
+    minQ: INITIAL_MIN,
+    maxQ: INITIAL_MAX,
+    expiresAt: Date.now() + SESSION_TTL,
   };
+}
 
-  for (const t of turns) {
-    const q = t.question.toLowerCase();
-    const y = t.answer === 'yes';
-    const n = t.answer === 'no';
-    if (!y && !n) continue;
-    const v = y;
+// ─────────────────────────────────────────────────────────────────────────────
+//  STATE UPDATE
+//  Called after each answer to lock domain/subDomain and store facts
+// ─────────────────────────────────────────────────────────────────────────────
+function applyAnswer(session, key, answer) {
+  const yes = answer === 'yes';
+  const no  = answer === 'no';
 
-    const has = (...kw) => kw.some(k => q.includes(k));
+  if (yes) session.facts[key] = true;
+  if (no)  session.facts[key] = false;
 
-    if (has('حقيقي','real person','واقعي')) S.real=v;
-    if (has('خيالي','fictional','وهمي'))   S.fictional=v;
-    if (has('كرتون','cartoon','رسوم','animated','أنيم','anime')) S.animated=v;
-
-    if (has('رجل','ذكر',' male',' man','boy'))     S.male=v;
-    if (has('امرأة','أنثى','female','woman','girl')) S.female=v;
-
-    if (has(' حي ','alive','يعيش','living'))                 S.alive=v;
-    if (has('متوفى','مات','توفي',' dead','deceased'))        S.alive=n;
-    if (has('تاريخي','historical','قديم','ancient','قرن'))   S.historical=v;
-
-    // broad domain
-    if (has('رياضي','athlete','لاعب') && !has('كرة القدم','كرة السلة','تنس','ملاكم','سباح','جولف')) S.athlete=v;
-    if (has('فنان','ممثل','مغني','مطرب','نجم','entertainer','actor','singer','artist') && !has('رياضي','athlete')) S.entertainer=v;
-    if (has('سياسي','politician','رئيس دول','وزير','president'))  S.politician=v;
-    if (has('عالم','scientist','مخترع','inventor','باحث'))         S.scientist=v;
-    if (has('رجل أعمال','businessman','ثري','مليارد','ceo'))       S.business=v;
-    if (has('ملكي','royal','ملك ','أمير','king ','queen','prince')) S.royalty=v;
-    if (has('كاتب','روائي','شاعر','writer','author','poet'))       S.writer=v;
-
-    // sport sub-domain
-    if (has('كرة القدم','football','soccer','لاعب كرة قدم'))       { S.footballer=v; if(v){S.athlete=true;S.basketballer=false;S.boxer=false;S.tennis_player=false;S.swimmer=false;} }
-    if (has('كرة السلة','basketball','nba'))                       { S.basketballer=v; if(v){S.athlete=true;S.footballer=false;} }
-    if (has(' تنس','tennis'))                                      { S.tennis_player=v; if(v){S.athlete=true;S.footballer=false;} }
-    if (has('ملاكم','boxer','boxing'))                             { S.boxer=v; if(v){S.athlete=true;S.footballer=false;} }
-    if (has('سباح','swimmer','swimming'))                          { S.swimmer=v; if(v){S.athlete=true;S.footballer=false;} }
-    if (has('غولف','golf'))                                        { S.golfer=v; if(v){S.athlete=true;S.footballer=false;} }
-
-    // entertainment sub-domain
-    if (has('ممثل','actor','actress','يمثل','أفلام سينما','cinema')) { S.actor=v; if(v){S.entertainer=true;} }
-    if (has('مغني','مطرب','singer','موسيقار','يغني'))               { S.singer=v; if(v){S.entertainer=true;} }
-    if (has('مخرج','director','إخراج'))                             { S.director=v; if(v){S.entertainer=true;} }
-    if (has('كوميديان','كوميدي','comedian'))                        { S.comedian=v; if(v){S.entertainer=true;} }
-
-    // nationality
-    if (has('عربي','arab') && !has('غير','non'))     S.arab=v;
-    if (has('سعودي','saudi'))      S.saudi=v;
-    if (has('مصري','egyptian'))    S.egyptian=v;
-    if (has('إماراتي','اماراتي','emirati')) S.emirati=v;
-    if (has('كويتي','kuwaiti'))    S.kuwaiti=v;
-    if (has('أمريكي','امريكي','american')) S.american=v;
-    if (has('بريطاني','إنجليزي','british','english') && !has('أمريكي')) S.british=v;
-    if (has('فرنسي','french'))     S.french=v;
-    if (has('إسباني','اسباني','spanish')) S.spanish=v;
-    if (has('برتغالي','portuguese')) S.portuguese=v;
-    if (has('أرجنتيني','argentine')) S.argentine=v;
-    if (has('برازيلي','brazilian')) S.brazilian=v;
-    if (has('ألماني','german'))    S.german=v;
-    if (has('إيطالي','italian'))   S.italian=v;
-
-    // achievements
-    if (has('كأس العالم','world cup'))     S.worldcup=v;
-    if (has('بالون دور','ballon'))         S.ballon_dor=v;
-    if (has('أوسكار','oscar'))             S.oscar=v;
-    if (has('غرامي','grammy'))             S.grammy=v;
-    if (has('أولمبي','olympic'))           S.olympics=v;
-    if (has('نوبل','nobel'))               S.nobel=v;
-    if (has('دوري أبطال','champions league','ucl')) S.champions_league=v;
-
-    // era
-    if (has('الآن','نشط الآن','still active','currently active','still playing','لا يزال')) S.era_now=v;
-    if (has('تسعينيات','90s','nineties'))  S.era_90s=v;
-    if (has('ثمانينيات','80s','eighties')) S.era_80s=v;
-    if (has('ألفين','2000s'))              S.era_2000s=v;
-
-    // entertainment details
-    if (has('أكشن','action movie'))        S.action_movies=v;
-    if (has('بطل خارق','superhero','خارق')) S.superhero_role=v;
-    if (has('مسلسل','tv series','tv show','series')) S.tv_series=v;
-    if (has('هوليود','hollywood'))         S.hollywood=v;
-
-    // sport details
-    if (has('مهاجم','striker','forward'))  S.striker=v;
-    if (has('حارس','goalkeeper','keeper')) S.goalkeeper=v;
-    if (has('مدافع','defender','defender')) S.defender=v;
-    if (has('وسط','midfielder','midfield')) S.midfielder=v;
-    if (has('رقم 10','number 10','القميص 10')) S.wears_10=v;
-    if (has('منتخب','national team'))      S.national_team=v;
-    if (has('ريال مدريد','real madrid'))   S.club_real=v;
-    if (has('برشلونة','barcelona','barca')) S.club_barca=v;
-    if (has('مانشستر يونايتد','man utd','man united')) S.club_manutd=v;
-    if (has('ليفربول','liverpool'))        S.club_liverpool=v;
-    if (has('تشيلسي','chelsea'))           S.club_chelsea=v;
-
-    // fictional
-    if (has('بطل خارق','superhero') && S.fictional) S.hero=v;
-    if (has('شرير','villain'))       S.villain=v;
-    if (has('مارفل','marvel'))       S.marvel=v;
-    if (has('dc','دي سي'))           S.dc=v;
-    if (has('ديزني','disney'))       S.disney=v;
-    if (has('أنيمي','anime','ياباني')) S.anime=v;
-    if (has('يطير','يستطيع الطير','fly','can fly')) S.can_fly=v;
-    if (has('قوى خارقة','super powers','has powers')) S.has_powers=v;
-    if (has('من فيلم','from a movie','movie character')) S.from_movie=v;
-    if (has('لعبة','from a game','video game'))          S.from_game=v;
+  // Broad domain locking (only set if not already set)
+  if (!session.domain) {
+    if (key === 'athlete'     && yes) session.domain = 'athlete';
+    if (key === 'entertainer' && yes) session.domain = 'entertainer';
+    if (key === 'politician'  && yes) session.domain = 'politician';
+    if (key === 'scientist'   && yes) session.domain = 'scientist';
+    if (key === 'business'    && yes) session.domain = 'business';
+    if (key === 'royalty'     && yes) session.domain = 'royalty';
+    if (key === 'writer'      && yes) session.domain = 'writer';
+    if (key === 'fictional'   && yes) session.domain = 'fictional';
+    // If answer is 'no' for multiple domains, it stays null until a yes
   }
-  return S;
+
+  // Sub-domain locking (sport)
+  if (!session.subDomain) {
+    if (key === 'sport_football'   && yes) { session.subDomain = 'footballer';   session.domain = 'athlete'; }
+    if (key === 'sport_basketball' && yes) { session.subDomain = 'basketballer'; session.domain = 'athlete'; }
+    if (key === 'sport_tennis'     && yes) { session.subDomain = 'tennis';       session.domain = 'athlete'; }
+    if (key === 'sport_boxing'     && yes) { session.subDomain = 'boxer';        session.domain = 'athlete'; }
+    if (key === 'sport_swimming'   && yes) { session.subDomain = 'swimmer';      session.domain = 'athlete'; }
+    if (key === 'sport_golf'       && yes) { session.subDomain = 'golfer';       session.domain = 'athlete'; }
+    // Sub-domain locking (entertainer)
+    if (key === 'ent_actor'    && yes) { session.subDomain = 'actor';     session.domain = 'entertainer'; }
+    if (key === 'ent_singer'   && yes) { session.subDomain = 'singer';    session.domain = 'entertainer'; }
+    if (key === 'ent_director' && yes) { session.subDomain = 'director';  session.domain = 'entertainer'; }
+    if (key === 'ent_comedian' && yes) { session.subDomain = 'comedian';  session.domain = 'entertainer'; }
+    if (key === 'ent_presenter'&& yes) { session.subDomain = 'comedian';  session.domain = 'entertainer'; } // reuse comedian list
+  }
 }
 
-// ──────────────────────────────────────────────────────────────
-//  DETECTED DOMAIN  — the narrowest confirmed domain
-// ──────────────────────────────────────────────────────────────
-function getDomain(S) {
-  // Narrowest first
-  if (S.footballer === true)    return 'footballer';
-  if (S.basketballer === true)  return 'basketballer';
-  if (S.tennis_player === true) return 'tennis';
-  if (S.boxer === true)         return 'boxer';
-  if (S.swimmer === true)       return 'swimmer';
-  if (S.golfer === true)        return 'golfer';
-  if (S.actor === true)         return 'actor';
-  if (S.singer === true)        return 'singer';
-  if (S.director === true)      return 'director';
-  if (S.comedian === true)      return 'comedian';
-  // Broad domains
-  if (S.athlete === true)       return 'athlete';
-  if (S.entertainer === true)   return 'entertainer';
-  if (S.politician === true)    return 'politician';
-  if (S.scientist === true)     return 'scientist';
-  if (S.business === true)      return 'business';
-  if (S.royalty === true)       return 'royalty';
-  if (S.writer === true)        return 'writer';
-  if (S.animated === true || S.fictional === true) return 'fictional';
-  return null;
-}
+// ─────────────────────────────────────────────────────────────────────────────
+//  NEXT QUESTION SELECTOR
+//  Returns the next unasked question from the correct list, or null if exhausted
+// ─────────────────────────────────────────────────────────────────────────────
+function nextQuestion(session) {
+  const { domain, subDomain, askedKeys, facts, language: lang } = session;
+  const ar = lang === 'ar';
 
-// ──────────────────────────────────────────────────────────────
-//  STRUCTURED QUESTION TREES
-//  Each entry: { key, ar, en }
-//  key = unique concept — never ask two entries with same key
-// ──────────────────────────────────────────────────────────────
-const TREE = {
-
-  // ── 0. Before any domain is known ──────────────────────────
-  pre_domain: [
-    { key:'reality',      ar:'هل هو شخص حقيقي؟',              en:'Is it a real person?' },
-    { key:'gender',       ar:'هل هو رجل؟',                    en:'Is it male?' },
-    { key:'athlete',      ar:'هل هو رياضي؟',                  en:'Is it an athlete?' },
-    { key:'entertainer',  ar:'هل هو فنان أو نجم؟',            en:'Is it an entertainer?' },
-    { key:'politician',   ar:'هل هو سياسي؟',                  en:'Is it a politician?' },
-    { key:'scientist',    ar:'هل هو عالم أو مخترع؟',          en:'Is it a scientist or inventor?' },
-    { key:'business',     ar:'هل هو رجل أعمال؟',              en:'Is it a businessperson?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'historical',   ar:'هل هو شخصية تاريخية؟',          en:'Is it a historical figure?' },
-  ],
-
-  // ── 1. Athlete — broad (before sport sub-type known) ──────
-  athlete: [
-    { key:'football',     ar:'هل يلعب كرة القدم؟',            en:'Does it play football/soccer?' },
-    { key:'basketball',   ar:'هل يلعب كرة السلة؟',            en:'Does it play basketball?' },
-    { key:'tennis',       ar:'هل يلعب التنس؟',                en:'Does it play tennis?' },
-    { key:'boxing',       ar:'هل هو ملاكم؟',                  en:'Is it a boxer?' },
-    { key:'swimming',     ar:'هل هو سباح؟',                   en:'Is it a swimmer?' },
-    { key:'golf',         ar:'هل يلعب الغولف؟',               en:'Does it play golf?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-  ],
-
-  // ── 2. Footballer ──────────────────────────────────────────
-  footballer: [
-    { key:'arab',           ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'south_american', ar:'هل هو من أمريكا الجنوبية؟',     en:'Is it South American?' },
-    { key:'european',       ar:'هل هو أوروبي؟',                 en:'Is it European?' },
-    { key:'worldcup',       ar:'هل فاز بكأس العالم؟',           en:'Did it win the World Cup?' },
-    { key:'ballon_dor',     ar:'هل فاز بالبالون دور؟',          en:"Did it win the Ballon d'Or?" },
-    { key:'champions_league',ar:'هل فاز بدوري أبطال أوروبا؟',  en:'Did it win the Champions League?' },
-    { key:'era_now',        ar:'هل لا يزال يلعب الآن؟',         en:'Is it still playing now?' },
-    { key:'portuguese',     ar:'هل هو برتغالي؟',               en:'Is it Portuguese?' },
-    { key:'argentine',      ar:'هل هو أرجنتيني؟',              en:'Is it Argentine?' },
-    { key:'brazilian',      ar:'هل هو برازيلي؟',               en:'Is it Brazilian?' },
-    { key:'french',         ar:'هل هو فرنسي؟',                 en:'Is it French?' },
-    { key:'spanish',        ar:'هل هو إسباني؟',                en:'Is it Spanish?' },
-    { key:'british',        ar:'هل هو بريطاني؟',               en:'Is it British?' },
-    { key:'german',         ar:'هل هو ألماني؟',                en:'Is it German?' },
-    { key:'striker',        ar:'هل هو مهاجم؟',                 en:'Is it a striker?' },
-    { key:'goalkeeper',     ar:'هل هو حارس مرمى؟',             en:'Is it a goalkeeper?' },
-    { key:'midfielder',     ar:'هل هو لاعب وسط؟',              en:'Is it a midfielder?' },
-    { key:'club_real',      ar:'هل لعب في ريال مدريد؟',         en:'Did it play for Real Madrid?' },
-    { key:'club_barca',     ar:'هل لعب في برشلونة؟',           en:'Did it play for Barcelona?' },
-    { key:'club_liverpool', ar:'هل لعب في ليفربول؟',           en:'Did it play for Liverpool?' },
-    { key:'era_90s',        ar:'هل اشتهر في التسعينيات؟',      en:'Did it rise to fame in the 90s?' },
-    { key:'saudi',          ar:'هل هو سعودي؟',                 en:'Is it Saudi?' },
-    { key:'egyptian',       ar:'هل هو مصري؟',                  en:'Is it Egyptian?' },
-    { key:'national_team',  ar:'هل يلعب مع منتخبه الوطني؟',    en:'Does it play for its national team?' },
-    { key:'alive',          ar:'هل هو حي؟',                    en:'Is it alive?' },
-  ],
-
-  // ── 3. Basketballer ───────────────────────────────────────
-  basketballer: [
-    { key:'american',     ar:'هل هو أمريكي؟',                  en:'Is it American?' },
-    { key:'era_now',      ar:'هل لا يزال يلعب الآن؟',          en:'Is it still playing now?' },
-    { key:'era_90s',      ar:'هل اشتهر في التسعينيات؟',       en:'Did it rise to fame in the 90s?' },
-    { key:'olympics',     ar:'هل فاز بميدالية أولمبية؟',       en:'Did it win an Olympic medal?' },
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-  ],
-
-  // ── 4. Tennis ─────────────────────────────────────────────
-  tennis: [
-    { key:'european',     ar:'هل هو أوروبي؟',                  en:'Is it European?' },
-    { key:'american',     ar:'هل هو أمريكي؟',                  en:'Is it American?' },
-    { key:'spanish',      ar:'هل هو إسباني؟',                  en:'Is it Spanish?' },
-    { key:'swiss',        ar:'هل هو سويسري؟',                  en:'Is it Swiss?' },
-    { key:'serbian',      ar:'هل هو صربي؟',                   en:'Is it Serbian?' },
-    { key:'olympics',     ar:'هل فاز بميدالية أولمبية؟',       en:'Did it win an Olympic medal?' },
-    { key:'era_now',      ar:'هل لا يزال يلعب الآن؟',          en:'Is it still playing now?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-  ],
-
-  // ── 5. Boxer ──────────────────────────────────────────────
-  boxer: [
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'american',     ar:'هل هو أمريكي؟',                  en:'Is it American?' },
-    { key:'era_now',      ar:'هل لا يزال يلعب الآن؟',          en:'Is it still active now?' },
-    { key:'era_90s',      ar:'هل اشتهر في التسعينيات؟',       en:'Did it rise to fame in the 90s?' },
-    { key:'olympics',     ar:'هل فاز بميدالية أولمبية؟',       en:'Did it win an Olympic gold?' },
-    { key:'heavyweight',  ar:'هل هو في وزن ثقيل؟',            en:'Is it a heavyweight?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-  ],
-
-  // ── 6. Entertainer broad (before actor/singer known) ──────
-  entertainer: [
-    { key:'actor',        ar:'هل هو ممثل؟',                   en:'Is it an actor?' },
-    { key:'singer',       ar:'هل هو مغني؟',                   en:'Is it a singer?' },
-    { key:'director',     ar:'هل هو مخرج؟',                   en:'Is it a film director?' },
-    { key:'comedian',     ar:'هل هو كوميديان؟',               en:'Is it a comedian?' },
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-    { key:'era_now',      ar:'هل لا يزال نشطاً الآن؟',        en:'Is it still active now?' },
-  ],
-
-  // ── 7. Actor ──────────────────────────────────────────────
-  actor: [
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'american',     ar:'هل هو أمريكي؟',                  en:'Is it American?' },
-    { key:'british',      ar:'هل هو بريطاني؟',                en:'Is it British?' },
-    { key:'oscar',        ar:'هل فاز بجائزة أوسكار؟',          en:'Did it win an Oscar?' },
-    { key:'action_movies',ar:'هل يمثل في أفلام أكشن؟',        en:'Is it known for action movies?' },
-    { key:'superhero_role',ar:'هل مثّل دور بطل خارق؟',        en:'Did it play a superhero role?' },
-    { key:'tv_series',    ar:'هل اشتهر في مسلسل؟',            en:'Is it famous from a TV series?' },
-    { key:'hollywood',    ar:'هل هو من هوليود؟',              en:'Is it from Hollywood?' },
-    { key:'era_now',      ar:'هل لا يزال يمثل الآن؟',         en:'Is it still acting now?' },
-    { key:'era_90s',      ar:'هل اشتهر في التسعينيات؟',       en:'Did it rise to fame in the 90s?' },
-    { key:'era_80s',      ar:'هل اشتهر في الثمانينيات؟',      en:'Did it rise to fame in the 80s?' },
-    { key:'egyptian',     ar:'هل هو مصري؟',                   en:'Is it Egyptian?' },
-    { key:'french',       ar:'هل هو فرنسي؟',                  en:'Is it French?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-  ],
-
-  // ── 8. Singer ─────────────────────────────────────────────
-  singer: [
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'american',     ar:'هل هو أمريكي؟',                  en:'Is it American?' },
-    { key:'british',      ar:'هل هو بريطاني؟',                en:'Is it British?' },
-    { key:'grammy',       ar:'هل فاز بجائزة غرامي؟',           en:'Did it win a Grammy?' },
-    { key:'era_now',      ar:'هل لا يزال يغني الآن؟',          en:'Is it still singing now?' },
-    { key:'era_90s',      ar:'هل اشتهر في التسعينيات؟',       en:'Did it rise to fame in the 90s?' },
-    { key:'era_80s',      ar:'هل اشتهر في الثمانينيات؟',      en:'Did it rise to fame in the 80s?' },
-    { key:'egyptian',     ar:'هل هو مصري؟',                   en:'Is it Egyptian?' },
-    { key:'saudi',        ar:'هل هو سعودي؟',                  en:'Is it Saudi?' },
-    { key:'kuwaiti',      ar:'هل هو كويتي؟',                  en:'Is it Kuwaiti?' },
-    { key:'french',       ar:'هل هو فرنسي؟',                  en:'Is it French?' },
-    { key:'band',         ar:'هل هو في فرقة موسيقية؟',         en:'Is it part of a band?' },
-    { key:'pop',          ar:'هل يغني موسيقى بوب؟',            en:'Is it a pop singer?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-  ],
-
-  // ── 9. Director ───────────────────────────────────────────
-  director: [
-    { key:'american',     ar:'هل هو أمريكي؟',                  en:'Is it American?' },
-    { key:'british',      ar:'هل هو بريطاني؟',                en:'Is it British?' },
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'oscar',        ar:'هل فاز بأوسكار أفضل مخرج؟',     en:'Did it win a Best Director Oscar?' },
-    { key:'action_movies',ar:'هل يخرج أفلام أكشن؟',           en:'Is it known for action films?' },
-    { key:'era_now',      ar:'هل لا يزال يخرج الآن؟',          en:'Is it still directing now?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-  ],
-
-  // ── 10. Comedian ──────────────────────────────────────────
-  comedian: [
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'american',     ar:'هل هو أمريكي؟',                  en:'Is it American?' },
-    { key:'british',      ar:'هل هو بريطاني؟',                en:'Is it British?' },
-    { key:'tv_series',    ar:'هل اشتهر في مسلسل كوميدي؟',     en:'Is it famous from a comedy show?' },
-    { key:'era_now',      ar:'هل لا يزال نشطاً الآن؟',        en:'Is it still active now?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-  ],
-
-  // ── 11. Politician ────────────────────────────────────────
-  politician: [
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'american',     ar:'هل هو أمريكي؟',                  en:'Is it American?' },
-    { key:'british',      ar:'هل هو بريطاني؟',                en:'Is it British?' },
-    { key:'french',       ar:'هل هو فرنسي؟',                  en:'Is it French?' },
-    { key:'president',    ar:'هل كان رئيس دولة؟',             en:'Did it serve as head of state?' },
-    { key:'king',         ar:'هل هو ملك أو أمير؟',            en:'Is it a king or prince?' },
-    { key:'era_now',      ar:'هل لا يزال في منصبه؟',          en:'Is it still in office?' },
-    { key:'historical',   ar:'هل هو شخصية تاريخية قديمة؟',    en:'Is it an ancient historical figure?' },
-    { key:'saudi',        ar:'هل هو سعودي؟',                  en:'Is it Saudi?' },
-    { key:'egyptian',     ar:'هل هو مصري؟',                   en:'Is it Egyptian?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-  ],
-
-  // ── 12. Scientist / Inventor ──────────────────────────────
-  scientist: [
-    { key:'historical',   ar:'هل هو شخصية تاريخية؟',          en:'Is it a historical figure?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-    { key:'american',     ar:'هل هو أمريكي؟',                  en:'Is it American?' },
-    { key:'british',      ar:'هل هو بريطاني؟',                en:'Is it British?' },
-    { key:'german',       ar:'هل هو ألماني؟',                 en:'Is it German?' },
-    { key:'nobel',        ar:'هل فاز بجائزة نوبل؟',           en:'Did it win a Nobel Prize?' },
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'physics',      ar:'هل هو في مجال الفيزياء؟',       en:'Is it known for physics?' },
-    { key:'medicine',     ar:'هل هو في مجال الطب؟',           en:'Is it known for medicine?' },
-    { key:'tech',         ar:'هل هو في مجال التكنولوجيا؟',    en:'Is it known for technology?' },
-  ],
-
-  // ── 13. Fictional / Animated ──────────────────────────────
-  fictional: [
-    { key:'superhero',    ar:'هل هو بطل خارق؟',               en:'Is it a superhero?' },
-    { key:'villain',      ar:'هل هو شرير؟',                   en:'Is it a villain?' },
-    { key:'marvel',       ar:'هل هو من عالم مارفل؟',           en:'Is it from Marvel?' },
-    { key:'dc',           ar:'هل هو من عالم DC؟',             en:'Is it from DC?' },
-    { key:'disney',       ar:'هل هو من ديزني؟',               en:'Is it from Disney?' },
-    { key:'anime',        ar:'هل هو من أنيمي؟',               en:'Is it from anime?' },
-    { key:'can_fly',      ar:'هل يستطيع الطيران؟',             en:'Can it fly?' },
-    { key:'has_powers',   ar:'هل لديه قوى خارقة؟',            en:'Does it have superpowers?' },
-    { key:'from_movie',   ar:'هل هو من فيلم سينمائي؟',        en:'Is it from a movie?' },
-    { key:'from_game',    ar:'هل هو من لعبة فيديو؟',          en:'Is it from a video game?' },
-    { key:'human',        ar:'هل هو بشري؟',                   en:'Is it human?' },
-    { key:'gender',       ar:'هل هو ذكر؟',                    en:'Is it male?' },
-  ],
-
-  // ── 14. Business ─────────────────────────────────────────
-  business: [
-    { key:'american',     ar:'هل هو أمريكي؟',                  en:'Is it American?' },
-    { key:'arab',         ar:'هل هو عربي؟',                   en:'Is it Arab?' },
-    { key:'alive',        ar:'هل هو حي؟',                     en:'Is it alive?' },
-    { key:'tech',         ar:'هل هو في مجال التكنولوجيا؟',    en:'Is it in the tech industry?' },
-    { key:'era_now',      ar:'هل لا يزال نشطاً الآن؟',        en:'Is it still active now?' },
-    { key:'historical',   ar:'هل هو شخصية تاريخية؟',          en:'Is it a historical figure?' },
-    { key:'british',      ar:'هل هو بريطاني؟',                en:'Is it British?' },
-  ],
-};
-
-// ──────────────────────────────────────────────────────────────
-//  GET NEXT STRUCTURED QUESTION
-//  Picks from the correct tree, never repeats, never contradicts
-// ──────────────────────────────────────────────────────────────
-function getNextStructuredQuestion(session) {
-  const S     = inferState(session.turns);
-  const asked = new Set(session.turns.map(t => conceptKey(t.question)));
-  const lang  = session.language;
-  const ar    = lang === 'ar';
-  const domain= getDomain(S);
-
-  // Determine which tree to use
-  let treeKeys = [];
-  if (!domain) {
-    treeKeys = ['pre_domain'];
+  // Decide which lists to search (in order)
+  let listNames;
+  if (subDomain && DOMAIN_LISTS[subDomain]) {
+    listNames = DOMAIN_LISTS[subDomain];
+  } else if (domain && DOMAIN_LISTS[domain]) {
+    listNames = DOMAIN_LISTS[domain];
   } else {
-    // Use narrowest domain tree + if broad domain still relevant, use it after
-    const treeMap = {
-      footballer:   ['footballer'],
-      basketballer: ['basketballer'],
-      tennis:       ['tennis'],
-      boxer:        ['boxer'],
-      swimmer:      ['swimmer'],
-      golfer:       ['swimmer'],   // reuse swimmer tree
-      athlete:      ['athlete'],
-      actor:        ['actor'],
-      singer:       ['singer'],
-      director:     ['director'],
-      comedian:     ['comedian'],
-      entertainer:  ['entertainer'],
-      politician:   ['politician'],
-      scientist:    ['scientist'],
-      business:     ['business'],
-      fictional:    ['fictional'],
-    };
-    treeKeys = treeMap[domain] ?? ['pre_domain'];
+    listNames = ['broad'];
   }
 
-  for (const treeKey of treeKeys) {
-    const tree = TREE[treeKey] ?? [];
-    for (const entry of tree) {
-      if (asked.has(entry.key)) continue;                   // already asked
-      const q = ar ? entry.ar : entry.en;
-      if (contradicts(q, S)) continue;                      // contradicts facts
-      if (skipBasedOnDomain(entry.key, S, domain)) continue; // skip irrelevant
-      return { key: entry.key, q };
+  for (const listName of listNames) {
+    const list = Q[listName] ?? [];
+    for (const entry of list) {
+      if (askedKeys.has(entry.key)) continue;              // already asked
+      if (!shouldAsk(entry.key, session))  continue;       // contradicted by facts
+      return { key: entry.key, text: ar ? entry.ar : entry.en };
     }
   }
 
-  return null; // tree exhausted — AI takes over
+  return null; // all lists exhausted
 }
 
-// Skip questions that are irrelevant given confirmed sub-domain
-function skipBasedOnDomain(key, S, domain) {
-  // If we know it's a footballer, skip other sport sub-domains
-  if (S.footballer === true && ['basketball','tennis','boxing','swimming','golf'].includes(key)) return true;
-  if (S.basketballer=== true && ['football','tennis','boxing','swimming','golf'].includes(key)) return true;
-  if (S.tennis_player=== true && ['football','basketball','boxing','swimming','golf'].includes(key)) return true;
-  if (S.boxer === true && ['football','basketball','tennis','swimming','golf'].includes(key)) return true;
-  if (S.swimmer === true && ['football','basketball','tennis','boxing','golf'].includes(key)) return true;
+// Returns false if this question is pointless given what we know
+function shouldAsk(key, session) {
+  const f = session.facts;
 
-  // If we know nationality, skip other nationality questions
-  if (S.arab === true && ['american','british','french','spanish','portuguese','argentine','brazilian','german','italian','dutch'].includes(key)) return true;
-  if (S.arab === false && ['saudi','egyptian','emirati','kuwaiti'].includes(key)) return true;
-  if (S.american === true && ['british','french','spanish','portuguese','argentine','brazilian','german','italian'].includes(key)) return true;
-  if (S.portuguese === true && ['argentine','brazilian','french','spanish','british','german'].includes(key)) return true;
-  if (S.argentine  === true && ['portuguese','brazilian','french','spanish','british','german'].includes(key)) return true;
-  if (S.egyptian   === true && ['saudi','emirati','kuwaiti'].includes(key)) return true;
-  if (S.saudi      === true && ['egyptian','emirati','kuwaiti'].includes(key)) return true;
+  // Nationality contradictions
+  const nationKeys = ['nat_arab','nat_american','nat_british','nat_french','nat_spanish',
+    'nat_portuguese','nat_argentine','nat_brazilian','nat_german','nat_italian','nat_dutch',
+    'nat_russian','nat_australian','nat_swiss','nat_serbian','nat_latin','nat_egyptian',
+    'nat_saudi','nat_kuwaiti','nat_emirati'];
+  const knownNat = nationKeys.find(k => f[k] === true);
+  if (knownNat && nationKeys.includes(key) && key !== knownNat) return false;
 
-  // If alive known, skip alive
-  if (S.alive !== null && key === 'alive') return true;
+  // Arab = true → skip non-Arab nationalities
+  if (f['nat_arab'] === true && ['nat_american','nat_british','nat_french','nat_spanish',
+    'nat_portuguese','nat_argentine','nat_brazilian','nat_german','nat_italian',
+    'nat_dutch','nat_russian','nat_australian','nat_swiss','nat_serbian','nat_latin'].includes(key)) return false;
 
-  // If entertainer known, skip actor/singer questions if sub-domain not confirmed yet — keep them
-  // If actor confirmed, skip singer/director/comedian sub-domain questions
-  if (S.actor === true && ['singer','director','comedian'].includes(key)) return true;
-  if (S.singer === true && ['actor','director','comedian'].includes(key)) return true;
-  if (S.director === true && ['actor','singer','comedian'].includes(key)) return true;
-  if (S.comedian === true && ['actor','singer','director'].includes(key)) return true;
+  // Arab = false → skip Arab sub-nationalities
+  if (f['nat_arab'] === false && ['nat_egyptian','nat_saudi','nat_kuwaiti','nat_emirati'].includes(key)) return false;
 
-  // If era known
-  if (S.era_90s === true && key === 'era_80s') return true;
-  if (S.era_80s === true && key === 'era_90s') return true;
-  if (S.era_now === true && ['era_90s','era_80s','era_2000s'].includes(key)) return true;
+  // S.American = true → skip European nationals
+  if (f['nat_s_american'] === true && ['nat_french','nat_spanish','nat_british','nat_german',
+    'nat_italian','nat_dutch','nat_russian'].includes(key)) return false;
 
-  // If worldcup won, skip ballon_dor separately (different questions, keep both)
-  // If marvel confirmed, skip dc/disney
-  if (S.marvel === true && ['dc','disney','anime'].includes(key)) return true;
-  if (S.dc     === true && ['marvel','disney','anime'].includes(key)) return true;
-  if (S.disney === true && ['marvel','dc','anime'].includes(key)) return true;
-  if (S.anime  === true && ['marvel','dc','disney'].includes(key)) return true;
+  // European = true → skip American/Arab/Latin
+  if (f['nat_european'] === true && ['nat_american','nat_arab','nat_latin'].includes(key)) return false;
 
-  return false;
+  // Sub-domain: if footballer, skip other sport questions
+  const sportKeys = ['sport_football','sport_basketball','sport_tennis','sport_boxing','sport_swimming','sport_golf','sport_other'];
+  const knownSport = sportKeys.find(k => f[k] === true);
+  if (knownSport && sportKeys.includes(key) && key !== knownSport) return false;
+
+  // Sub-domain: if actor, skip other entertainer types
+  const entKeys = ['ent_actor','ent_singer','ent_director','ent_comedian','ent_presenter'];
+  const knownEnt = entKeys.find(k => f[k] === true);
+  if (knownEnt && entKeys.includes(key) && key !== knownEnt) return false;
+
+  // Alive/dead contradictions
+  if (f['alive'] === true  && key === 'historical') return false;
+  if (f['alive'] === false && key === 'era_active')  return false;
+  if (f['historical'] === true && key === 'era_active') return false;
+
+  // Era contradictions
+  if (f['era_active'] === true && ['era_90s','era_80s'].includes(key)) return false;
+  if (f['era_90s']    === true && key === 'era_80s') return false;
+  if (f['era_80s']    === true && key === 'era_90s') return false;
+
+  // Fictional contradictions
+  if (f['real'] === true  && ['fictional','fic_marvel','fic_dc','fic_disney','fic_anime','fic_superhero','fic_villain','fic_fly','fic_powers','fic_game','fic_movie','fic_human'].includes(key)) return false;
+  if (f['fictional'] === true && ['real','athlete','entertainer','politician','scientist','business','royalty','writer'].includes(key)) return false;
+
+  // Fictional sub-type contradictions
+  if (f['fic_marvel'] === true  && ['fic_dc','fic_disney','fic_anime'].includes(key)) return false;
+  if (f['fic_dc']     === true  && ['fic_marvel','fic_disney','fic_anime'].includes(key)) return false;
+  if (f['fic_disney'] === true  && ['fic_marvel','fic_dc','fic_anime'].includes(key)) return false;
+  if (f['fic_anime']  === true  && ['fic_marvel','fic_dc','fic_disney'].includes(key)) return false;
+
+  // Domain contradictions — if one broad domain confirmed, skip others
+  const domainKeys = ['athlete','entertainer','politician','scientist','business','royalty','writer','fictional'];
+  const knownDomain = domainKeys.find(k => f[k] === true);
+  if (knownDomain && domainKeys.includes(key) && key !== knownDomain) return false;
+
+  return true;
 }
 
-// ──────────────────────────────────────────────────────────────
-//  CONCEPT KEY — for dedup tracking
-// ──────────────────────────────────────────────────────────────
-function conceptKey(text) {
-  const q = text.toLowerCase();
-  const has = (...kw) => kw.some(k => q.includes(k));
-  if (has('حقيقي','real person','واقعي')) return 'reality';
-  if (has('رجل','ذكر',' male',' man','boy')) return 'gender';
-  if (has('امرأة','أنثى','female','woman','girl')) return 'gender';
-  if (has('عربي','arab') && !has('غير','non')) return 'arab';
-  if (has('سعودي','saudi')) return 'saudi';
-  if (has('مصري','egyptian')) return 'egyptian';
-  if (has('إماراتي','اماراتي','emirati')) return 'emirati';
-  if (has('كويتي','kuwaiti')) return 'kuwaiti';
-  if (has('أمريكي','امريكي','american')) return 'american';
-  if (has('بريطاني','إنجليزي','british','english') && !has('أمريكي')) return 'british';
-  if (has('فرنسي','french')) return 'french';
-  if (has('إسباني','اسباني','spanish')) return 'spanish';
-  if (has('برتغالي','portuguese')) return 'portuguese';
-  if (has('أرجنتيني','argentine')) return 'argentine';
-  if (has('برازيلي','brazilian')) return 'brazilian';
-  if (has('ألماني','german')) return 'german';
-  if (has('إيطالي','italian')) return 'italian';
-  if (has('سويسري','swiss')) return 'swiss';
-  if (has('صربي','serbian')) return 'serbian';
-  if (has(' حي ','alive','يعيش','living') && !has('متوفى','dead')) return 'alive';
-  if (has('متوفى','مات','توفي',' dead','deceased')) return 'alive';
-  if (has('تاريخي','historical','قديم','ancient')) return 'historical';
-  if (has('رياضي','athlete') && !has('كرة القدم','football','كرة السلة','basketball')) return 'athlete_broad';
-  if (has('كرة القدم','football','soccer','لاعب كرة قدم')) return 'football';
-  if (has('كرة السلة','basketball','nba')) return 'basketball';
-  if (has(' تنس','tennis')) return 'tennis';
-  if (has('ملاكم','boxer','boxing')) return 'boxing';
-  if (has('سباح','swimmer','swimming')) return 'swimming';
-  if (has('غولف','golf')) return 'golf';
-  if (has('كأس العالم','world cup')) return 'worldcup';
-  if (has('بالون دور','ballon')) return 'ballon_dor';
-  if (has('دوري أبطال','champions league','ucl')) return 'champions_league';
-  if (has('أوسكار','oscar')) return 'oscar';
-  if (has('غرامي','grammy')) return 'grammy';
-  if (has('أولمبي','olympic','ميدالية')) return 'olympics';
-  if (has('نوبل','nobel')) return 'nobel';
-  if (has('فنان','نجم','entertainer','artist') && !has('ممثل','actor','مغني','singer')) return 'entertainer_broad';
-  if (has('ممثل','actor','actress','يمثل') && !has('رياضي','athlete')) return 'actor';
-  if (has('مغني','مطرب','singer','يغني') && !has('رياضي','athlete')) return 'singer';
-  if (has('مخرج','director','إخراج')) return 'director';
-  if (has('كوميدي','comedian')) return 'comedian';
-  if (has('سياسي','politician','رئيس دول','president') && !has('كرة')) return 'politician';
-  if (has('عالم','scientist','مخترع','inventor')) return 'scientist';
-  if (has('رجل أعمال','businessman','ثري','مليارد')) return 'business';
-  if (has('ملكي','royal','ملك ','أمير','king ','queen','prince')) return 'royalty';
-  if (has('كاتب','روائي','شاعر','writer','author','poet')) return 'writer';
-  if (has('مهاجم','striker','forward')) return 'striker';
-  if (has('حارس','goalkeeper','keeper')) return 'goalkeeper';
-  if (has('مدافع','defender')) return 'defender';
-  if (has('وسط','midfielder')) return 'midfielder';
-  if (has('ريال مدريد','real madrid')) return 'club_real';
-  if (has('برشلونة','barcelona','barca')) return 'club_barca';
-  if (has('ليفربول','liverpool')) return 'club_liverpool';
-  if (has('مانشستر','man utd','man united')) return 'club_manutd';
-  if (has('تشيلسي','chelsea')) return 'club_chelsea';
-  if (has('الآن','نشط الآن','still active','still playing','currently','لا يزال')) return 'era_now';
-  if (has('تسعينيات','90s','nineties')) return 'era_90s';
-  if (has('ثمانينيات','80s','eighties')) return 'era_80s';
-  if (has('ألفين','2000s')) return 'era_2000s';
-  if (has('أكشن','action movie')) return 'action_movies';
-  if (has('بطل خارق','superhero') && !has('رياضي','هو')) return 'superhero_role';
-  if (has('مسلسل','tv series','tv show','series')) return 'tv_series';
-  if (has('هوليود','hollywood')) return 'hollywood';
-  if (has('أمريكا الجنوبية','south american')) return 'south_american';
-  if (has('أوروبي','european')) return 'european';
-  if (has('رئيس','president','head of state')) return 'president';
-  if (has('ملك ','king ','أمير','prince','queen')) return 'king';
-  if (has('شرير','villain')) return 'villain';
-  if (has('مارفل','marvel')) return 'marvel';
-  if (has('dc','دي سي')) return 'dc';
-  if (has('ديزني','disney')) return 'disney';
-  if (has('أنيمي','anime')) return 'anime';
-  if (has('يطير','يستطيع الطير','fly','can fly')) return 'can_fly';
-  if (has('قوى خارقة','super powers','has powers')) return 'has_powers';
-  if (has('من فيلم','from a movie','movie character')) return 'from_movie';
-  if (has('لعبة','from a game','video game')) return 'from_game';
-  if (has('خيالي','fictional','وهمي')) return 'fictional';
-  if (has('كرتون','cartoon','رسوم','animated')) return 'animated';
-  if (has('منفرد','solo')) return 'solo';
-  if (has('فرقة','band')) return 'band';
-  if (has('بوب','pop')) return 'pop';
-  if (has('أفلام سينما','cinema','movies') && !has('أكشن')) return 'movies';
-  if (has('فيزياء','physics')) return 'physics';
-  if (has('طب','medicine')) return 'medicine';
-  if (has('تكنولوجيا','technology','tech')) return 'tech';
-  if (has('منتخب','national team')) return 'national_team';
-  if (has('وزن ثقيل','heavyweight')) return 'heavyweight';
-  if (has('غولف','golf')) return 'golf';
-  return q.replace(/\s+/g,'_').slice(0,50);
-}
-
-// ──────────────────────────────────────────────────────────────
-//  CONTRADICTION CHECK
-// ──────────────────────────────────────────────────────────────
-function contradicts(q, S) {
-  const t = q.toLowerCase();
-  const has = (...kw) => kw.some(k => t.includes(k));
-  if (S.male   === true  && has('امرأة','أنثى','female','woman','girl'))         return true;
-  if (S.female === true  && has('رجل','ذكر',' male',' man','boy'))              return true;
-  if (S.alive  === true  && has('متوفى','مات','توفي',' dead','deceased'))       return true;
-  if (S.alive  === false && has(' حي ','alive','يعيش','لا يزال','still'))       return true;
-  if (S.real   === true  && has('خيالي','fiction','كرتون','وهمي','animated'))   return true;
-  if (S.fictional=== true&& has('حقيقي','real person','واقعي'))                 return true;
-  if (S.arab   === true  && has('أجنبي','غير عربي','non-arab'))                 return true;
-  if (S.arab   === false && has('عربي','arab') && !has('غير','non'))            return true;
-  if (S.footballer=== true && has('كرة السلة','basketball','تنس','tennis','ملاكم','boxer','سباح','swimmer','غولف','golf')) return true;
-  if (S.basketballer===true&& has('كرة القدم','football','تنس','tennis','ملاكم','boxer')) return true;
-  if (S.boxer  === true  && has('كرة القدم','football','كرة السلة','basketball','تنس','tennis')) return true;
-  if (S.actor  === true  && has('رياضي','athlete','سياسي','politician'))        return true;
-  if (S.singer === true  && has('رياضي','athlete','سياسي','politician'))        return true;
-  if (S.politician===true&& has('رياضي','athlete','فنان','ممثل','مغني'))       return true;
-  return false;
-}
-
-// ──────────────────────────────────────────────────────────────
-//  AI — ONLY FOR GUESSING
-// ──────────────────────────────────────────────────────────────
-function buildFactsSummary(S, lang) {
-  const ar = lang === 'ar';
+// ─────────────────────────────────────────────────────────────────────────────
+//  FACTS SUMMARY for GPT-4o guess prompt
+// ─────────────────────────────────────────────────────────────────────────────
+function factsSummary(session) {
+  const f = session.facts;
   const parts = [];
-  const domain = getDomain(S);
-  if (domain) parts.push(ar ? `المجال: ${domain}` : `Domain: ${domain}`);
-  if (S.male  === true)  parts.push(ar ? 'ذكر'       : 'male');
-  if (S.female=== true)  parts.push(ar ? 'أنثى'      : 'female');
-  if (S.arab  === true)  parts.push(ar ? 'عربي'      : 'Arab');
-  if (S.american===true) parts.push(ar ? 'أمريكي'    : 'American');
-  if (S.british===true)  parts.push(ar ? 'بريطاني'   : 'British');
-  if (S.french===true)   parts.push(ar ? 'فرنسي'     : 'French');
-  if (S.portuguese===true) parts.push(ar ? 'برتغالي' : 'Portuguese');
-  if (S.argentine===true)  parts.push(ar ? 'أرجنتيني': 'Argentine');
-  if (S.brazilian===true)  parts.push(ar ? 'برازيلي' : 'Brazilian');
-  if (S.spanish===true)    parts.push(ar ? 'إسباني'  : 'Spanish');
-  if (S.egyptian===true)   parts.push(ar ? 'مصري'    : 'Egyptian');
-  if (S.saudi===true)      parts.push(ar ? 'سعودي'   : 'Saudi');
-  if (S.alive ===true)   parts.push(ar ? 'حي'        : 'alive');
-  if (S.alive ===false)  parts.push(ar ? 'متوفى'     : 'deceased');
-  if (S.worldcup===true) parts.push(ar ? 'فاز بكأس العالم' : 'won World Cup');
-  if (S.ballon_dor===true) parts.push(ar ? 'فاز بالبالون دور' : "won Ballon d'Or");
-  if (S.oscar===true)    parts.push(ar ? 'فاز بأوسكار'  : 'won Oscar');
-  if (S.grammy===true)   parts.push(ar ? 'فاز بغرامي'   : 'won Grammy');
-  if (S.champions_league===true) parts.push(ar ? 'فاز بدوري أبطال أوروبا' : 'won Champions League');
-  if (S.era_now===true)  parts.push(ar ? 'لا يزال نشطاً' : 'still active');
-  if (S.era_90s===true)  parts.push(ar ? 'اشتهر في التسعينيات' : 'famous in 90s');
-  if (S.era_80s===true)  parts.push(ar ? 'اشتهر في الثمانينيات': 'famous in 80s');
-  if (S.historical===true) parts.push(ar ? 'تاريخي قديم' : 'historical');
-  if (S.action_movies===true) parts.push(ar ? 'أفلام أكشن' : 'action movies');
-  if (S.superhero_role===true) parts.push(ar ? 'لعب دور بطل خارق' : 'played superhero');
-  if (S.striker===true)  parts.push(ar ? 'مهاجم'     : 'striker');
-  if (S.goalkeeper===true) parts.push(ar ? 'حارس مرمى' : 'goalkeeper');
-  if (S.club_real===true) parts.push(ar ? 'لعب في ريال مدريد' : 'played for Real Madrid');
-  if (S.club_barca===true) parts.push(ar ? 'لعب في برشلونة' : 'played for Barcelona');
-  if (S.club_liverpool===true) parts.push(ar ? 'لعب في ليفربول' : 'played for Liverpool');
-  if (S.marvel===true) parts.push(ar ? 'من مارفل' : 'from Marvel');
-  if (S.dc===true)     parts.push(ar ? 'من DC'     : 'from DC');
-  if (S.disney===true) parts.push(ar ? 'من ديزني'  : 'from Disney');
-  if (S.anime===true)  parts.push(ar ? 'من أنيمي'  : 'from anime');
-  if (S.villain===true) parts.push(ar ? 'شرير'      : 'villain');
-  if (S.hero===true)    parts.push(ar ? 'بطل خارق'  : 'superhero');
-  return parts.join(' | ');
+  const add = (cond, label) => { if (cond) parts.push(label); };
+
+  add(session.subDomain, `sub-domain: ${session.subDomain}`);
+  add(session.domain && !session.subDomain, `domain: ${session.domain}`);
+  add(f.male    === true,  'male');
+  add(f.male    === false, 'female');
+  add(f.alive   === true,  'alive');
+  add(f.alive   === false, 'deceased');
+  add(f.historical=== true,'historical figure');
+  add(f.nat_arab=== true,  'Arab');
+  add(f.nat_american===true,'American');
+  add(f.nat_british===true,'British');
+  add(f.nat_french===true, 'French');
+  add(f.nat_spanish===true,'Spanish');
+  add(f.nat_portuguese===true,'Portuguese');
+  add(f.nat_argentine===true,'Argentine');
+  add(f.nat_brazilian===true,'Brazilian');
+  add(f.nat_german===true, 'German');
+  add(f.nat_italian===true,'Italian');
+  add(f.nat_russian===true,'Russian');
+  add(f.nat_australian===true,'Australian');
+  add(f.nat_swiss===true,  'Swiss');
+  add(f.nat_serbian===true,'Serbian');
+  add(f.nat_latin===true,  'Latin American');
+  add(f.nat_egyptian===true,'Egyptian');
+  add(f.nat_saudi===true,  'Saudi');
+  add(f.nat_kuwaiti===true,'Kuwaiti');
+  add(f.nat_emirati===true,'Emirati');
+  add(f.ach_worldcup===true,'won World Cup');
+  add(f.ach_ballondor===true,"won Ballon d'Or");
+  add(f.ach_ucl===true,'won Champions League');
+  add(f.ach_oscar===true,'won Oscar');
+  add(f.ach_grammy===true,'won Grammy');
+  add(f.ach_nobel===true,'won Nobel Prize');
+  add(f.ach_olympics===true,'won Olympic medal');
+  add(f.ach_grandslam===true,'won Grand Slam');
+  add(f.era_active===true,'still active now');
+  add(f.era_90s===true,'rose to fame in 90s');
+  add(f.era_80s===true,'rose to fame in 80s');
+  add(f.nat_s_american===true,'South American');
+  add(f.nat_european===true,'European');
+  add(f.pos_striker===true,'striker/forward');
+  add(f.pos_goalkeeper===true,'goalkeeper');
+  add(f.pos_midfielder===true,'midfielder');
+  add(f.pos_defender===true,'defender');
+  add(f.club_real===true,'played for Real Madrid');
+  add(f.club_barca===true,'played for Barcelona');
+  add(f.club_manu===true,'played for Man United');
+  add(f.club_liver===true,'played for Liverpool');
+  add(f.work_action===true,'known for action movies/films');
+  add(f.work_superhero===true,'played superhero role');
+  add(f.work_tv===true,'famous from TV show/series');
+  add(f.work_comedy===true,'known for comedy');
+  add(f.work_standup===true,'stand-up comedian');
+  add(f.style_pop===true,'pop singer');
+  add(f.style_band===true,'part of a band');
+  add(f.style_rap===true,'rapper');
+  add(f.fic_marvel===true,'from Marvel');
+  add(f.fic_dc===true,'from DC');
+  add(f.fic_disney===true,'from Disney');
+  add(f.fic_anime===true,'from anime');
+  add(f.fic_superhero===true,'superhero');
+  add(f.fic_villain===true,'villain');
+  add(f.fic_fly===true,'can fly');
+  add(f.fic_powers===true,'has superpowers');
+  add(f.fic_game===true,'from a video game');
+  add(f.field_physics===true,'physics');
+  add(f.field_medicine===true,'medicine');
+  add(f.field_tech===true,'technology');
+  add(f.weight_heavy===true,'heavyweight');
+  add(f.role_president===true,'served as president/head of state');
+  add(f.role_king===true,'king/queen/prince');
+  add(f.type_novelist===true,'novelist');
+  add(f.type_poet===true,'poet');
+
+  // Negative facts that help narrow down
+  const trueNat = ['nat_arab','nat_american','nat_british','nat_french','nat_spanish',
+    'nat_portuguese','nat_argentine','nat_brazilian','nat_german','nat_italian',
+    'nat_dutch','nat_russian','nat_australian','nat_swiss','nat_serbian','nat_latin',
+    'nat_egyptian','nat_saudi','nat_kuwaiti','nat_emirati'];
+  const noNats = trueNat.filter(k => f[k] === false).map(k => k.replace('nat_',''));
+  if (noNats.length) parts.push(`NOT: ${noNats.join(', ')}`);
+
+  return parts.join(' | ') || 'no confirmed facts yet';
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  GPT-4o GUESS
+// ─────────────────────────────────────────────────────────────────────────────
 async function makeGuess(session) {
-  if (!openai) return { type:'guess', name: session.language==='ar'?'شخصية مشهورة':'Famous person', confidence:0.2 };
-
-  const S = inferState(session.turns);
-  const facts = buildFactsSummary(S, session.language);
-  const rejected = session.rejectedGuesses;
   const ar = session.language === 'ar';
+  const fallback = { type:'guess', name: ar ? 'شخصية مشهورة' : 'A famous person', confidence:0.2 };
 
-  const sysPrompt = ar
-    ? `أنت محلل بيانات متخصص في تحديد الشخصيات. بناءً على الحقائق المؤكدة فقط، اختر الشخصية الأكثر احتمالاً.
-قواعد صارمة:
-- أعطِ اسماً واحداً فقط
-- الاسم بالعربية كما هو معروف (مثل "محمد صلاح" لا "صلاح")
+  if (!openai) return fallback;
+
+  const summary = factsSummary(session);
+  const rejected = session.rejectedGuesses;
+  const qa = session.turns.map((t,i) => `Q${i+1}: ${t.question} → ${t.answer}`).join('\n');
+
+  const system = ar
+    ? `أنت متخصص في تحديد الشخصيات. بناءً على الحقائق المؤكدة، خمّن الشخصية الأكثر احتمالاً.
+قواعد:
+- اسم واحد فقط بالعربية كما هو معروف (مثال: "محمد صلاح"، "فيروز"، "رونالدو")
 - لا تكرر: [${rejected.join(', ')||'لا شيء'}]
-- استجابة JSON فقط: {"type":"guess","name":"...","confidence":0.88}`
-    : `You are a character identification expert. Based ONLY on confirmed facts, pick the single most likely character.
+- JSON فقط بدون أي نص آخر: {"type":"guess","name":"...","confidence":0.9}`
+    : `You are a character identification expert. Based ONLY on confirmed facts, name the single most likely character.
 Rules:
-- One name only, spelled as commonly known
+- Full name as commonly known (e.g. "Lionel Messi", "Tom Hanks", "Iron Man")
 - NEVER repeat: [${rejected.join(', ')||'none'}]
-- JSON only: {"type":"guess","name":"...","confidence":0.88}`;
+- JSON only, no extra text: {"type":"guess","name":"...","confidence":0.9}`;
 
-  const userMsg = `Confirmed facts: ${facts || 'none yet'}
-Q&A history:
-${session.turns.map((t,i)=>`Q${i+1}: ${t.question} → ${t.answer}`).join('\n')}
-Rejected: ${rejected.join(', ')||'none'}
-Best single guess now.`;
+  const user = `Confirmed facts: ${summary}
+Full Q&A:
+${qa || 'none yet'}
+Rejected guesses: ${rejected.join(', ')||'none'}
+Make your single best guess now.`;
 
   try {
     const resp = await openai.chat.completions.create({
-      model, temperature:0.15, max_tokens:80,
+      model, temperature:0.1, max_tokens:80,
       response_format: { type:'json_object' },
-      messages: [
-        { role:'system', content:sysPrompt },
-        { role:'user',   content:userMsg  },
-      ],
+      messages: [{ role:'system', content:system }, { role:'user', content:user }],
     });
     const parsed = JSON.parse(resp.choices[0]?.message?.content ?? '{}');
     const name = String(parsed.name ?? '').trim();
-    if (!name || rejected.includes(name)) throw new Error('bad guess');
+    if (!name || rejected.includes(name)) return fallback;
     return {
-      type:'guess', name,
-      confidence: typeof parsed.confidence==='number' ? Math.min(1,Math.max(0,parsed.confidence)) : 0.75,
+      type: 'guess',
+      name,
+      confidence: typeof parsed.confidence === 'number'
+        ? Math.min(1, Math.max(0, parsed.confidence)) : 0.75,
     };
-  } catch {
-    return { type:'guess', name:ar?'شخصية مشهورة':'Famous person', confidence:0.2 };
+  } catch (e) {
+    console.error('makeGuess:', e?.message);
+    return fallback;
   }
 }
 
-// ──────────────────────────────────────────────────────────────
-//  MAIN ENGINE  — structured questions + AI guessing
-// ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  MAIN ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
 async function runEngine(session) {
-  const S = inferState(session.turns);
+  const { questionsThisPhase: qCount, minQ, maxQ } = session;
 
-  // Must guess?
-  if (session.questionsSincePhaseReset >= session.maxQuestionsBeforeGuess) {
-    return await makeGuess(session);
+  // Must guess now (hit ceiling)
+  if (qCount >= maxQ) {
+    return makeGuess(session);
   }
 
-  // Can't guess yet — get next structured question
-  if (session.questionsSincePhaseReset < session.minQuestionsBeforeGuess) {
-    const next = getNextStructuredQuestion(session);
-    if (next) return { type:'question', text: next.q };
-    // Structured tree exhausted early — use AI guess if we've asked enough, else fallback
-    if (session.questionsSincePhaseReset >= 5) return await makeGuess(session);
-    return { type:'question', text: session.language==='ar' ? 'هل هو حي؟' : 'Is it still alive?' };
-  }
-
-  // In the window (canGuess): get next structured question
-  const next = getNextStructuredQuestion(session);
-  if (!next) {
-    // Tree exhausted — guess now
-    return await makeGuess(session);
-  }
-
-  // We have more structured questions — but should we guess?
-  // Let AI decide via confidence, but only if we have strong facts
-  const facts = buildFactsSummary(S, session.language);
-  const hasEnoughFacts = session.turns.filter(t=>t.answer==='yes').length >= 5;
-  if (hasEnoughFacts && openai) {
-    // Quick confidence check
-    const check = await openai.chat.completions.create({
-      model, temperature:0.1, max_tokens:60,
-      response_format:{ type:'json_object' },
-      messages:[
-        { role:'system', content:'Given confirmed facts, are you confident enough (≥0.88) to guess the exact character? Return {"confident":true/false}' },
-        { role:'user',   content:`Facts: ${facts}\nRejected: ${session.rejectedGuesses.join(',')||'none'}` },
-      ],
-    }).catch(() => null);
-    if (check) {
-      try {
-        const r = JSON.parse(check.choices[0]?.message?.content??'{}');
-        if (r.confident === true) return await makeGuess(session);
-      } catch { /* ignore */ }
+  // Still in question phase — get next structured question
+  if (qCount < minQ) {
+    const q = nextQuestion(session);
+    if (q) {
+      session.pendingKey = q.key;
+      return { type:'question', text: q.text };
     }
+    // Exhausted all questions before minQ — guess anyway
+    return makeGuess(session);
   }
 
-  return { type:'question', text: next.q };
+  // In the window [minQ, maxQ) — pick question or guess
+  const q = nextQuestion(session);
+  if (!q) {
+    // No more questions to ask — guess
+    return makeGuess(session);
+  }
+
+  // We have more questions, but maybe we're confident enough to guess?
+  // Simple heuristic: if we know domain + sub-domain + nationality + 1 achievement → guess
+  const f = session.facts;
+  const readyToGuess = session.subDomain
+    && (f.nat_arab===true || f.nat_american===true || f.nat_british===true ||
+        f.nat_french===true || f.nat_portuguese===true || f.nat_argentine===true ||
+        f.nat_brazilian===true || f.nat_spanish===true || f.nat_german===true ||
+        f.nat_egyptian===true || f.nat_saudi===true || f.nat_kuwaiti===true ||
+        f.nat_emirati===true || f.nat_australian===true || f.nat_russian===true)
+    && (f.ach_worldcup===true || f.ach_ballondor===true || f.ach_ucl===true ||
+        f.ach_oscar===true || f.ach_grammy===true || f.ach_nobel===true ||
+        f.ach_olympics===true || f.ach_grandslam===true ||
+        f.era_active!==null || f.era_90s!==null || f.era_80s!==null);
+
+  if (readyToGuess && qCount >= minQ) {
+    return makeGuess(session);
+  }
+
+  session.pendingKey = q.key;
+  return { type:'question', text: q.text };
 }
 
-// ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 //  WIKIPEDIA
-// ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 async function fetchWiki(name, lang) {
-  const l = lang==='ar' ? 'ar' : 'en';
+  const l = lang === 'ar' ? 'ar' : 'en';
   const title = encodeURIComponent(String(name).replace(/ /g,'_'));
   try {
     const res = await fetch(
@@ -823,28 +718,21 @@ async function fetchWiki(name, lang) {
   }
 }
 
-// ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 //  ROUTES
-// ──────────────────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => {
   res.json({ ok:true, model, hasOpenAI:Boolean(openai) });
 });
 
-// POST /api/game/start  — { language:"ar"|"en" }
+// POST /api/game/start
+// Body: { language: "ar" | "en" }
 // Returns: { sessionId, type:"question", text:"..." }
 app.post('/api/game/start', async (req, res) => {
   try {
     const language = req.body?.language === 'en' ? 'en' : 'ar';
     const sessionId = crypto.randomUUID();
-    const session = {
-      id:sessionId, language,
-      turns:[], rejectedGuesses:[],
-      guessStreak:0, questionsSincePhaseReset:0,
-      minQuestionsBeforeGuess: INITIAL_MIN,
-      maxQuestionsBeforeGuess: INITIAL_MAX,
-      expiresAt: Date.now() + SESSION_TTL_MS,
-    };
+    const session = newSession(language);
     sessions.set(sessionId, session);
     const result = await runEngine(session);
     return res.json({ sessionId, ...result });
@@ -854,17 +742,31 @@ app.post('/api/game/start', async (req, res) => {
   }
 });
 
-// POST /api/game/answer  — { sessionId, question, answer:"yes"|"no"|"maybe"|"dont_know" }
+// POST /api/game/answer
+// Body: { sessionId, question, answer:"yes"|"no"|"maybe"|"dont_know" }
 // Returns: { type:"question", text } OR { type:"guess", name, confidence }
 app.post('/api/game/answer', async (req, res) => {
   try {
     const { sessionId, question, answer } = req.body ?? {};
-    const session = sessions.get(String(sessionId??''));
+    const session = sessions.get(String(sessionId ?? ''));
     if (!session) return res.status(404).json({ error:'Session not found' });
 
-    session.expiresAt = Date.now() + SESSION_TTL_MS;
-    session.turns.push({ question:String(question??''), answer:normalize(answer) });
-    session.questionsSincePhaseReset += 1;
+    session.expiresAt = Date.now() + SESSION_TTL;
+
+    const normAnswer = (() => {
+      const m = { yes:'yes', no:'no', maybe:'maybe', dontknow:'dont_know', dont_know:'dont_know' };
+      return m[String(answer ?? '').trim().toLowerCase().replace(/[^a-z_]/g,'')] ?? 'dont_know';
+    })();
+
+    // Use the key we stored when sending the question
+    const key = session.pendingKey ?? 'unknown';
+    session.askedKeys.add(key);
+    session.pendingKey = null;
+    session.turns.push({ key, question: String(question ?? ''), answer: normAnswer });
+    session.questionsThisPhase += 1;
+
+    // Update domain/facts
+    applyAnswer(session, key, normAnswer);
 
     return res.json(await runEngine(session));
   } catch(e) {
@@ -873,42 +775,41 @@ app.post('/api/game/answer', async (req, res) => {
   }
 });
 
-// POST /api/game/guess-confirm  — { sessionId, guessName, correct:true|false }
-// Flow:
-//   correct=true       → { type:"revealed", guessName, wiki:{...} }
-//   wrong, streak<3    → immediate next guess  { type:"guess", name, confidence }
-//   wrong, streak>=3   → reset phase, back to domain-focused questions
+// POST /api/game/guess-confirm
+// Body: { sessionId, guessName, correct:true|false }
+// Returns:
+//   correct=true  → { type:"revealed", guessName, wiki:{title,extract,imageURL,articleURL} }
+//   wrong < 3     → { type:"guess", name, confidence }  (immediate next guess)
+//   wrong = 3     → { type:"question", text }            (back to questions, same domain)
 app.post('/api/game/guess-confirm', async (req, res) => {
   try {
     const { sessionId, guessName, correct } = req.body ?? {};
-    const session = sessions.get(String(sessionId??''));
+    const session = sessions.get(String(sessionId ?? ''));
     if (!session) return res.status(404).json({ error:'Session not found' });
 
-    session.expiresAt = Date.now() + SESSION_TTL_MS;
+    session.expiresAt = Date.now() + SESSION_TTL;
 
     if (correct) {
-      const wiki = await fetchWiki(String(guessName??''), session.language);
-      session.guessStreak = 0;
-      session.questionsSincePhaseReset = 0;
-      session.minQuestionsBeforeGuess = INITIAL_MIN;
-      session.maxQuestionsBeforeGuess = INITIAL_MAX;
+      const wiki = await fetchWiki(String(guessName ?? ''), session.language);
       return res.json({ type:'revealed', guessName, wiki });
     }
 
+    // Wrong guess
     if (guessName) session.rejectedGuesses.push(String(guessName));
     session.guessStreak += 1;
 
-    // Guesses 2 & 3: try again immediately (no questions between)
-    if (session.guessStreak < MAX_CONSECUTIVE_GUESSES) {
+    // Guess 2 or 3: try another guess immediately (no questions between)
+    if (session.guessStreak < MAX_GUESSES) {
       return res.json(await makeGuess(session));
     }
 
-    // 3 wrong guesses → back to domain-focused questions (5–8)
-    // IMPORTANT: we do NOT reset turns — domain context is preserved
+    // After 3 wrong guesses → back to questions
+    // Domain context is PRESERVED — we continue with the same domain lists
+    // Only reset the question counter for the new phase
     session.guessStreak = 0;
-    session.questionsSincePhaseReset = 0;
-    session.minQuestionsBeforeGuess = FOLLOWUP_MIN;
-    session.maxQuestionsBeforeGuess = FOLLOWUP_MAX;
+    session.questionsThisPhase = 0;
+    session.minQ = FOLLOWUP_MIN;
+    session.maxQ = FOLLOWUP_MAX;
 
     return res.json(await runEngine(session));
   } catch(e) {
@@ -917,7 +818,7 @@ app.post('/api/game/guess-confirm', async (req, res) => {
   }
 });
 
-// GET /api/wiki?name=...&language=ar
+// GET /api/wiki?name=...&language=ar|en
 app.get('/api/wiki', async (req, res) => {
   try {
     const name = String(req.query.name ?? '');
@@ -930,12 +831,12 @@ app.get('/api/wiki', async (req, res) => {
   }
 });
 
-// ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 //  START
-// ──────────────────────────────────────────────────────────────
-app.listen(port, () => {
-  console.log(`✅ Magic Ball  →  http://localhost:${port}`);
-  console.log(`🤖 Model: ${model} | OpenAI: ${Boolean(openai)}`);
-  console.log(`Phase 1: ${INITIAL_MIN}–${INITIAL_MAX} q's → up to ${MAX_CONSECUTIVE_GUESSES} guesses`);
-  console.log(`Phase 2: ${FOLLOWUP_MIN}–${FOLLOWUP_MAX} q's (same domain) → guess again`);
+// ─────────────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`✅ Magic Ball  →  http://localhost:${PORT}`);
+  console.log(`🤖 Model: ${MODEL} | OpenAI: ${Boolean(openai)}`);
+  console.log(`📋 Phase 1: ${INITIAL_MIN}–${INITIAL_MAX} questions → up to ${MAX_GUESSES} guesses`);
+  console.log(`🔁 Phase 2: ${FOLLOWUP_MIN}–${FOLLOWUP_MAX} domain-specific questions → guess again`);
 });
